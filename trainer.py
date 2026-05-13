@@ -1124,7 +1124,7 @@ if __name__ == "__main__":
         training_set=int(args.training_set),
         num_workers=args.num_workers,
         surrogate_nsga_steps=int(args.surrogate_nsga_steps),
-        updates_per_epoch=int(args.updates_per_epoch),
+        updates_per_epoch=args.updates_per_epoch,
         device=args.device,
         rollout_device=str(args.rollout_device),
         surrogate_device=str(args.surrogate_device),
