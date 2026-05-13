@@ -35,7 +35,7 @@ os.environ["OPENBLAS_NUM_THREADS"] = "1"
 @dataclass
 class TrainConfig:
     num_workers: int = 12
-    episodes_per_worker: int = 2
+    episodes_per_worker: int = 1
     max_fe: int = 120
     init_size: int = 80
     batch_size: int = 128
@@ -43,7 +43,7 @@ class TrainConfig:
     gamma: float = 1.0
     lr: float = 1e-4
     target_update_interval: int = 20
-    train_iters: int = 2000
+    train_iters: int = 50
     epsilon_start: float = 0.3
     epsilon_end: float = 0.05
     epsilon_decay_iters: int = 1000
@@ -324,8 +324,8 @@ def _compute_ddqn_loss_same_objectives(agent, target_agent, batch, cfg):
     sigma_sur = to_tensor(pad_stack_rows(sigma_sur), device)
     progress = to_tensor(np.asarray(progress).reshape(-1, 1), device)
 
-    lower_bound = to_tensor(pad_stack_rows(lower_bound).squeeze(-1), device)
-    upper_bound = to_tensor(pad_stack_rows(upper_bound).squeeze(-1), device)
+    lower_bound = to_tensor(pad_stack_rows(lower_bound), device)
+    upper_bound = to_tensor(pad_stack_rows(upper_bound), device)
 
     actions = torch.tensor(actions, dtype=torch.long, device=device)
     rewards = torch.tensor(rewards, dtype=torch.float32, device=device)
@@ -672,97 +672,81 @@ class DiscSAEAEnv:
 
 
 @ray.remote(num_cpus=1)
-class RolloutWorker:
-    def __init__(self, worker_id, cfg_dict, env_specs):
-        self.worker_id = worker_id
-        self.cfg = cfg_dict
-        self.env_specs = list(env_specs)
+def rollout_episode_task(state_dict_cpu, cfg_dict, problem_name, dim, seed, epsilon):
+    device = str(cfg_dict.get("rollout_device", "cpu"))
 
-    def rollout(self, state_dict_cpu, epsilon, episodes):
-        device = str(self.cfg.get("rollout_device", "cpu"))
+    agent = Disc(
+        hidden_dim=cfg_dict["hidden_dim"],
+        n_heads=cfg_dict["n_heads"],
+        ff_dim=cfg_dict["ff_dim"],
+        dropout=cfg_dict["dropout"],
+        logit_scale=cfg_dict["logit_scale"],
+        epsilon=epsilon,
+    ).to(device)
 
-        agent = Disc(
-            hidden_dim=self.cfg["hidden_dim"],
-            n_heads=self.cfg["n_heads"],
-            ff_dim=self.cfg["ff_dim"],
-            dropout=self.cfg["dropout"],
-            logit_scale=self.cfg["logit_scale"],
-            epsilon=epsilon,
-        ).to(device)
+    agent.load_state_dict(state_dict_cpu)
+    agent.eval()
 
-        agent.load_state_dict(state_dict_cpu)
-        agent.eval()
+    env = DiscSAEAEnv(
+        problem_name=problem_name,
+        dim=int(dim),
+        seed=int(seed),
+        cfg_dict=cfg_dict,
+    )
+    state = env.reset()
+    total_reward = 0.0
+    init_hv = float(env.init_hv)
+    transitions = []
 
-        transitions = []
-        ep_rewards = []
-        env_stats = {}
-        for env_idx, spec in enumerate(self.env_specs):
-            key = env_key(spec["problem_name"], spec["dim"])
-            env_stats[key] = {
-                "rewards": [],
-                "init_hv": [],
-                "final_hv": [],
-            }
+    done = False
+    while not done:
+        with torch.no_grad():
+            out = agent(
+                x_true=to_tensor(state["x_true"][None, ...], device),
+                y_true=to_tensor(state["y_true"][None, ...], device),
+                x_sur=to_tensor(state["x_sur"][None, ...], device),
+                y_sur=to_tensor(state["y_sur"][None, ...], device),
+                sigma_sur=to_tensor(state["sigma_sur"][None, ...], device),
+                progress=to_tensor(state["progress"].reshape(1, 1), device),
+                lower_bound=to_tensor(state["lower_bound"][None, ...], device),
+                upper_bound=to_tensor(state["upper_bound"][None, ...], device),
+                decode_type="epsilon_greedy",
+                epsilon=epsilon,
+            )
 
-            for ep in range(episodes):
-                env = DiscSAEAEnv(
-                    problem_name=spec["problem_name"],
-                    dim=int(spec["dim"]),
-                    seed=100000 * self.worker_id + 1000 * env_idx + ep,
-                    cfg_dict=self.cfg,
-                )
-                state = env.reset()
-                total_reward = 0.0
-                init_hv = float(env.init_hv)
+        action = select_action_from_output(out)
+        next_state, reward, done = env.step(action, state)
 
-                done = False
-                while not done:
-                    with torch.no_grad():
-                        out = agent(
-                            x_true=to_tensor(state["x_true"][None, ...], device),
-                            y_true=to_tensor(state["y_true"][None, ...], device),
-                            x_sur=to_tensor(state["x_sur"][None, ...], device),
-                            y_sur=to_tensor(state["y_sur"][None, ...], device),
-                            sigma_sur=to_tensor(state["sigma_sur"][None, ...], device),
-                            progress=to_tensor(state["progress"].reshape(1, 1), device),
-                            lower_bound=to_tensor(state["lower_bound"][None, ...], device),
-                            upper_bound=to_tensor(state["upper_bound"][None, ...], device),
-                            decode_type="epsilon_greedy",
-                            epsilon=epsilon,
-                        )
+        transitions.append((
+            state["x_true"],
+            state["y_true"],
+            state["x_sur"],
+            state["y_sur"],
+            state["sigma_sur"],
+            float(state["progress"][0]),
+            state["lower_bound"],
+            state["upper_bound"],
+            action,
+            reward,
+            next_state["x_true"],
+            next_state["y_true"],
+            next_state["x_sur"],
+            next_state["y_sur"],
+            next_state["sigma_sur"],
+            float(next_state["progress"][0]),
+            float(done),
+        ))
 
-                    action = select_action_from_output(out)
-                    next_state, reward, done = env.step(action, state)
+        total_reward += reward
+        state = next_state
 
-                    transitions.append((
-                        state["x_true"],
-                        state["y_true"],
-                        state["x_sur"],
-                        state["y_sur"],
-                        state["sigma_sur"],
-                        float(state["progress"][0]),
-                        state["lower_bound"],
-                        state["upper_bound"],
-                        action,
-                        reward,
-                        next_state["x_true"],
-                        next_state["y_true"],
-                        next_state["x_sur"],
-                        next_state["y_sur"],
-                        next_state["sigma_sur"],
-                        float(next_state["progress"][0]),
-                        float(done),
-                    ))
-
-                    total_reward += reward
-                    state = next_state
-
-                ep_rewards.append(total_reward)
-                env_stats[key]["rewards"].append(float(total_reward))
-                env_stats[key]["init_hv"].append(init_hv)
-                env_stats[key]["final_hv"].append(float(env.current_hv()))
-
-        return transitions, ep_rewards, env_stats
+    return {
+        "transitions": transitions,
+        "episode_reward": float(total_reward),
+        "env_key": env_key(problem_name, dim),
+        "init_hv": init_hv,
+        "final_hv": float(env.current_hv()),
+    }
 
 
 def save_training_checkpoint(agent, cfg, problem_name, epoch, mean_reward, best_reward):
@@ -851,15 +835,7 @@ def train_disc_ddqn_ray(
     target_agent.eval()
 
     optimizer = optim.Adam(agent.parameters(), lr=cfg.lr)
-    replay = ReplayBuffer(cfg.replay_size)
     best_reward = -float("inf")
-
-    worker_env_specs = [env_specs[i::actual_num_workers] for i in range(actual_num_workers)]
-    workers = [
-        RolloutWorker.remote(i, cfg_dict, worker_env_specs[i])
-        for i in range(actual_num_workers)
-        if len(worker_env_specs[i]) > 0
-    ]
 
     print(
         "Training config | "
@@ -883,6 +859,7 @@ def train_disc_ddqn_ray(
     for it in range(cfg.train_iters):
         epoch = int(it) + 1
         epsilon = epsilon_by_iter(it, cfg)
+        replay = ReplayBuffer(cfg.replay_size)
 
         print(
             f"[Epoch {epoch:04d}] start | "
@@ -895,33 +872,40 @@ def train_disc_ddqn_ray(
         )
 
         state_cpu = clone_state_dict_cpu(agent)
-        futures = [
-            w.rollout.remote(
-                state_dict_cpu=state_cpu,
-                epsilon=epsilon,
-                episodes=cfg.episodes_per_worker,
-            )
-            for w in workers
-        ]
+        futures = []
+        for env_idx, spec in enumerate(env_specs):
+            for ep in range(int(cfg.episodes_per_worker)):
+                seed = 100000 * epoch + 1000 * env_idx + ep
+                futures.append(
+                    rollout_episode_task.remote(
+                        state_dict_cpu=state_cpu,
+                        cfg_dict=cfg_dict,
+                        problem_name=spec["problem_name"],
+                        dim=int(spec["dim"]),
+                        seed=int(seed),
+                        epsilon=epsilon,
+                    )
+                )
+        if len(futures) == 0:
+            raise ValueError("No rollout tasks were created.")
         results = ray.get(futures)
 
         all_rewards = []
         per_env_stats = {}
-        for transitions, ep_rewards, env_stats in results:
-            replay.extend(transitions)
-            all_rewards.extend(ep_rewards)
-            for key, stats in env_stats.items():
-                bucket = per_env_stats.setdefault(
-                    key,
-                    {
-                        "rewards": [],
-                        "init_hv": [],
-                        "final_hv": [],
-                    },
-                )
-                bucket["rewards"].extend(float(v) for v in stats["rewards"])
-                bucket["init_hv"].extend(float(v) for v in stats["init_hv"])
-                bucket["final_hv"].extend(float(v) for v in stats["final_hv"])
+        for result in results:
+            replay.extend(result["transitions"])
+            all_rewards.append(float(result["episode_reward"]))
+            bucket = per_env_stats.setdefault(
+                result["env_key"],
+                {
+                    "rewards": [],
+                    "init_hv": [],
+                    "final_hv": [],
+                },
+            )
+            bucket["rewards"].append(float(result["episode_reward"]))
+            bucket["init_hv"].append(float(result["init_hv"]))
+            bucket["final_hv"].append(float(result["final_hv"]))
 
         mean_ep_reward = float(np.mean(all_rewards)) if all_rewards else 0.0
         per_env_summaries = {}
