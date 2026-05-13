@@ -1009,6 +1009,7 @@ def train_disc_ddqn_ray(
                 "reward_mean": float("nan"),
                 "shape_group": 0,
                 "group_sizes": [],
+                "shape_group_summary": {},
             }
             log(
                 f"[Epoch {epoch:04d}] "
@@ -1027,7 +1028,7 @@ def train_disc_ddqn_ray(
                 f"td_error_mean = {empty_metrics['td_error_mean']} | "
                 f"td_error_std = {empty_metrics['td_error_std']} | "
                 f"shape_group = {empty_metrics['shape_group']} | "
-                f"group_sizes = {empty_metrics['group_sizes']}"
+                f"group_sizes = {empty_metrics['shape_group_summary']}"
             )
             best_reward = save_training_checkpoint(agent, cfg, cfg.heldout_problem, epoch, mean_ep_reward, best_reward)
             continue
@@ -1054,6 +1055,7 @@ def train_disc_ddqn_ray(
                 "reward_mean": float(ddqn_metrics["reward_mean"]),
                 "shape_group": int(ddqn_metrics["shape_group"]),
                 "group_sizes": list(ddqn_metrics["group_sizes"]),
+                "shape_group_detail": dict(ddqn_metrics.get("shape_group_detail", {})),
             }
             update_metrics_list.append(update_metrics)
 
@@ -1064,7 +1066,17 @@ def train_disc_ddqn_ray(
         for key in ["td_loss", "grad_norm", "q_mean", "q_std", "target_mean", "td_error_mean", "td_error_std", "reward_mean"]:
             mean_update_metrics[key] = float(np.mean([m[key] for m in update_metrics_list]))
         mean_update_metrics["shape_group"] = int(round(np.mean([m["shape_group"] for m in update_metrics_list])))
-        mean_update_metrics["group_sizes"] = [m["group_sizes"] for m in update_metrics_list]
+        group_keys = sorted(
+            {
+                int(obj)
+                for m in update_metrics_list
+                for obj in m.get("shape_group_detail", {}).keys()
+            }
+        )
+        mean_update_metrics["shape_group_summary"] = {
+            int(obj): float(np.mean([m.get("shape_group_detail", {}).get(int(obj), 0) for m in update_metrics_list]))
+            for obj in group_keys
+        }
 
         log(
             f"[Epoch {epoch:04d}] "
@@ -1084,7 +1096,7 @@ def train_disc_ddqn_ray(
             f"td_error_mean={mean_update_metrics['td_error_mean']:.4f} | "
             f"td_error_std={mean_update_metrics['td_error_std']:.4f} | "
             f"shape_group={mean_update_metrics['shape_group']} | "
-            f"group_sizes={mean_update_metrics['group_sizes']} | "
+            f"group_sizes={mean_update_metrics['shape_group_summary']} | "
             f"batch_r={mean_update_metrics['reward_mean']:.4f} | "
             f"ep_return_per_fe={mean_ep_reward:.4f}"
         )
@@ -1101,7 +1113,7 @@ def train_disc_ddqn_ray(
             f"td_error_mean = {mean_update_metrics['td_error_mean']:.4f} | "
             f"td_error_std = {mean_update_metrics['td_error_std']:.4f} | "
             f"shape_group = {mean_update_metrics['shape_group']} | "
-            f"group_sizes = {mean_update_metrics['group_sizes']}"
+            f"group_sizes = {mean_update_metrics['shape_group_summary']}"
         )
 
         best_reward = save_training_checkpoint(agent, cfg, cfg.heldout_problem, epoch, mean_ep_reward, best_reward)
