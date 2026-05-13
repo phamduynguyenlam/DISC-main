@@ -976,7 +976,6 @@ def train_disc_ddqn_ray(
             results = ray_mod.get(futures)
         else:
             results = [f.result() for f in futures]
-        update_start_time = time.perf_counter()
 
         per_env_stats = {}
         for result in results:
@@ -1018,6 +1017,7 @@ def train_disc_ddqn_ray(
                 f"init HV = {stats['init_hv']:.6f}, "
                 f"final HV = {stats['final_hv']:.6f}"
             )
+        update_start_time = time.perf_counter()
 
         if len(replay) < cfg.batch_size:
             empty_metrics = {
