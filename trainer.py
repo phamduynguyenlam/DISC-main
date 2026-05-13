@@ -57,8 +57,8 @@ class TrainConfig:
     surrogate_model: str = "kan"
     surrogate_nsga_steps: int = 100
     offspring_size: int = 80
-    kan_steps: int = 100
-    kan_hidden_width: int = 64
+    kan_steps: int = 25
+    kan_hidden_width: int = 10
     kan_grid: int = 5
     reward_scheme: int = 1
     policy_mode: str = "epsilon_greedy"
