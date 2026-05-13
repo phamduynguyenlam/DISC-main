@@ -14,7 +14,7 @@ from agents.disc import Disc
 from nsga2_solver import run_surrogate_nsga2
 from problem.problem import SUPPORTED_PROBLEMS, make_problem
 from ref_points_hv import get_reference_point
-from reward import hypervolume, pareto_front
+from reward import hypervolume, pareto_front, reward_scheme_1
 from surrogate.surrogate_model import (
     estimate_uncertainty,
     fit_gp_surrogates,
@@ -237,6 +237,7 @@ class StepRecord:
     selected_x: list[float]
     surrogate_y: list[float]
     true_y: list[float]
+    reward: float
     hv: float
     archive_size: int
 
@@ -420,9 +421,11 @@ def main() -> None:
 
     disc = build_disc(args, map_location=str(args.device))
     history: list[StepRecord] = []
+    step_rewards: list[float] = []
 
+    # Pretrain surrogate on the initial archive (default: 80 points).
+    surrogate = build_surrogate(args, archive_x, archive_y)
     for step in range(n_evo_steps):
-        surrogate = build_surrogate(args, archive_x, archive_y)
 
         offspring_pop_size = int(args.offspring_size)
         nsga2_surrogate, nsga2_models = surrogate_or_models_for_nsga2(surrogate)
@@ -462,6 +465,14 @@ def main() -> None:
         selected_x = offspring_x[selected_idx : selected_idx + 1]
         selected_pred = offspring_pred[selected_idx]
         selected_true = np.asarray(problem.evaluate(selected_x), dtype=np.float32)
+        previous_front = pareto_front(np.asarray(archive_y, dtype=np.float32))
+        step_reward = float(
+            reward_scheme_1(
+                previous_front=previous_front,
+                selected_objectives=selected_true,
+                ref_point=ref_point,
+            )
+        )
 
         archive_x = np.vstack([archive_x, selected_x]).astype(np.float32)
         archive_y = np.vstack([archive_y, selected_true]).astype(np.float32)
@@ -478,12 +489,16 @@ def main() -> None:
             selected_x=selected_x.reshape(-1).astype(float).tolist(),
             surrogate_y=selected_pred.astype(float).tolist(),
             true_y=selected_true.reshape(-1).astype(float).tolist(),
+            reward=step_reward,
             hv=float(hv),
             archive_size=int(archive_x.shape[0]),
         )
         history.append(record)
+        step_rewards.append(step_reward)
 
         print(f"iter {record.step} | front = {front_size} | HV = {record.hv:.6f}")
+        # Refit surrogate after admitting one new true-evaluated sample.
+        surrogate = build_surrogate(args, archive_x, archive_y)
 
     final_front = pareto_front(archive_y)
     plot_path = plot_results(
@@ -514,6 +529,7 @@ def main() -> None:
         "reference_point": ref_point.astype(float).tolist(),
         "archive_size": int(archive_x.shape[0]),
         "final_hv": float(hypervolume(archive_y, ref_point)),
+        "mean_reward_40_steps": float(np.mean(step_rewards)) if len(step_rewards) > 0 else 0.0,
         "final_front_size": int(final_front.shape[0]),
         "final_front": final_front.astype(float).tolist(),
         "plot_path": plot_path,
@@ -525,6 +541,7 @@ def main() -> None:
         out_path = Path(args.output_json)
         out_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
+    print(f"mean reward ({n_evo_steps} steps) = {summary['mean_reward_40_steps']:.6f}")
     print(json.dumps({k: v for k, v in summary.items() if k not in {"history", "final_front"}}, indent=2))
 
 

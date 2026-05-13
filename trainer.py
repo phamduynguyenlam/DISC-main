@@ -588,6 +588,7 @@ class DiscSAEAEnv:
         self.ref_point = None
         self.nsga2_problem = None
         self.init_hv = None
+        self.surrogate = None
 
     def _progress(self):
         return float(self.t) / float(max(self.max_steps - 1, 1))
@@ -598,14 +599,17 @@ class DiscSAEAEnv:
         return cfg_local
 
     def _fit_surrogate(self):
-        return build_surrogate_from_cfg(
+        self.surrogate = build_surrogate_from_cfg(
             self._surrogate_cfg(),
             archive_x=self.archive_x,
             archive_y=self.archive_y,
         )
+        return self.surrogate
 
     def _refresh_offspring(self):
-        surrogate = self._fit_surrogate()
+        if self.surrogate is None:
+            raise RuntimeError("Surrogate is not initialized. Call _fit_surrogate() before refreshing offspring.")
+        surrogate = self.surrogate
         nsga2_surrogate, nsga2_models = surrogate_or_models_for_nsga2(surrogate)
         offspring_x, offspring_y = run_surrogate_nsga2(
             gps=nsga2_models,
@@ -653,6 +657,8 @@ class DiscSAEAEnv:
         )
         self.init_hv = float(hypervolume(self.archive_y, self.ref_point))
         self.nsga2_problem = make_nsga2_problem_adapter(self.problem, int(self.archive_y.shape[1]))
+        # Pretrain surrogate on the initial archive (default: 80 points), then generate first offspring pool.
+        self._fit_surrogate()
         self._refresh_offspring()
         return self._build_state()
 
@@ -675,6 +681,8 @@ class DiscSAEAEnv:
 
         self.t += 1
         done = self.t >= self.max_steps
+        # Refit surrogate after admitting the new true-evaluated sample.
+        self._fit_surrogate()
         self._refresh_offspring()
         return self._build_state(), float(reward), bool(done)
 
