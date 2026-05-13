@@ -38,7 +38,7 @@ class TrainConfig:
     episodes_per_worker: int = 1
     max_fe: int = 120
     init_size: int = 80
-    batch_size: int = 128
+    batch_size: int = 64
     replay_size: int = 50000
     gamma: float = 1.0
     lr: float = 1e-4
