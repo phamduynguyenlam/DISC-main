@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from collections import deque
 from concurrent.futures import ProcessPoolExecutor
 
-import ray
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -318,10 +317,10 @@ def _compute_ddqn_loss_same_objectives(agent, target_agent, batch, cfg):
     ) = batch
 
     device = cfg.device
-    archive_mask = to_tensor(build_row_mask(x_true), device)
-    candidate_mask = to_tensor(build_row_mask(x_sur), device)
-    next_archive_mask = to_tensor(build_row_mask(next_x_true), device)
-    next_candidate_mask = to_tensor(build_row_mask(next_x_sur), device)
+    archive_mask = torch.as_tensor(build_row_mask(x_true), dtype=torch.bool, device=device)
+    candidate_mask = torch.as_tensor(build_row_mask(x_sur), dtype=torch.bool, device=device)
+    next_archive_mask = torch.as_tensor(build_row_mask(next_x_true), dtype=torch.bool, device=device)
+    next_candidate_mask = torch.as_tensor(build_row_mask(next_x_sur), dtype=torch.bool, device=device)
 
     x_true = to_tensor(pad_stack_rows(x_true), device)
     y_true = to_tensor(pad_stack_rows(y_true), device)
@@ -754,18 +753,6 @@ def _rollout_episode_impl(state_dict_cpu, cfg_dict, problem_name, dim, seed, eps
     }
 
 
-@ray.remote(num_cpus=1)
-def rollout_episode_task(state_dict_cpu, cfg_dict, problem_name, dim, seed, epsilon):
-    return _rollout_episode_impl(
-        state_dict_cpu=state_dict_cpu,
-        cfg_dict=cfg_dict,
-        problem_name=problem_name,
-        dim=dim,
-        seed=seed,
-        epsilon=epsilon,
-    )
-
-
 def rollout_episode_task_local(state_dict_cpu, cfg_dict, problem_name, dim, seed, epsilon):
     return _rollout_episode_impl(
         state_dict_cpu=state_dict_cpu,
@@ -862,9 +849,16 @@ def train_disc_ddqn_ray(
         log_fp.write(str(msg) + "\n")
 
     executor = None
+    ray_rollout_remote = None
+    ray_mod = None
     if bool(use_ray):
-        if not ray.is_initialized():
-            ray.init(num_cpus=actual_num_workers, ignore_reinit_error=True)
+        try:
+            import ray as ray_mod  # type: ignore
+        except Exception as exc:
+            raise ImportError("ray is not available. Install ray or run without --ray.") from exc
+        if not ray_mod.is_initialized():
+            ray_mod.init(num_cpus=actual_num_workers, ignore_reinit_error=True)
+        ray_rollout_remote = ray_mod.remote(num_cpus=1)(rollout_episode_task_local)
     else:
         executor = ProcessPoolExecutor(max_workers=actual_num_workers)
 
@@ -928,7 +922,7 @@ def train_disc_ddqn_ray(
                 seed = 100000 * epoch + 1000 * env_idx + ep
                 if bool(use_ray):
                     futures.append(
-                        rollout_episode_task.remote(
+                        ray_rollout_remote.remote(
                             state_dict_cpu=state_cpu,
                             cfg_dict=cfg_dict,
                             problem_name=spec["problem_name"],
@@ -952,7 +946,7 @@ def train_disc_ddqn_ray(
         if len(futures) == 0:
             raise ValueError("No rollout tasks were created.")
         if bool(use_ray):
-            results = ray.get(futures)
+            results = ray_mod.get(futures)
         else:
             results = [f.result() for f in futures]
 
@@ -983,6 +977,13 @@ def train_disc_ddqn_ray(
                 "init_hv": float(np.mean(stats["init_hv"])),
                 "final_hv": float(np.mean(stats["final_hv"])),
             }
+        for key, stats in per_env_summaries.items():
+            log(
+                f"{key} epoch {epoch} done, "
+                f"mean reward = {stats['mean_reward']:.4f}, "
+                f"init HV = {stats['init_hv']:.6f}, "
+                f"final HV = {stats['final_hv']:.6f}"
+            )
 
         if len(replay) < cfg.batch_size:
             empty_metrics = {
@@ -1001,13 +1002,6 @@ def train_disc_ddqn_ray(
                 f"envs_active={len(env_specs)}/{len(env_specs)} | "
                 f"replay={len(replay)} | skip update | ep_return={mean_ep_reward:.4f}"
             )
-            for key, stats in per_env_summaries.items():
-                log(
-                    f"{key} epoch {epoch} done, "
-                    f"mean reward = {stats['mean_reward']:.4f}, "
-                    f"init HV = {stats['init_hv']:.6f}, "
-                    f"final HV = {stats['final_hv']:.6f}"
-                )
             log(
                 f"epoch {epoch} done | mean reward = {mean_ep_reward:.4f} | "
                 f"set = {cfg.training_set} | heldout = {cfg.heldout_problem} | "
@@ -1080,13 +1074,6 @@ def train_disc_ddqn_ray(
             f"batch_r={mean_update_metrics['reward_mean']:.4f} | "
             f"ep_return={mean_ep_reward:.4f}"
         )
-        for key, stats in per_env_summaries.items():
-            log(
-                f"epoch {epoch} -> {key} epoch {epoch} done, "
-                f"mean reward = {stats['mean_reward']:.4f}, "
-                f"init HV = {stats['init_hv']:.6f}, "
-                f"final HV = {stats['final_hv']:.6f}"
-            )
         log(
             f"epoch {epoch} done | mean reward = {mean_ep_reward:.4f} | "
             f"set = {cfg.training_set} | heldout = {cfg.heldout_problem} | "
@@ -1107,6 +1094,8 @@ def train_disc_ddqn_ray(
 
     if executor is not None:
         executor.shutdown(wait=True)
+    if bool(use_ray) and ray_mod is not None and ray_mod.is_initialized():
+        ray_mod.shutdown()
     log_fp.close()
     return agent
 
