@@ -5,6 +5,7 @@ import random
 from datetime import datetime
 from dataclasses import dataclass
 from collections import deque
+from concurrent.futures import ProcessPoolExecutor
 
 import ray
 import torch
@@ -119,6 +120,7 @@ def parse_args():
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--rollout_device", type=str, default="cpu")
     parser.add_argument("--surrogate_device", type=str, default="cpu")
+    parser.add_argument("--ray", action="store_true")
     return parser.parse_args()
 
 
@@ -675,8 +677,7 @@ class DiscSAEAEnv:
         return float(hypervolume(np.asarray(self.archive_y, dtype=np.float32), self.ref_point))
 
 
-@ray.remote(num_cpus=1)
-def rollout_episode_task(state_dict_cpu, cfg_dict, problem_name, dim, seed, epsilon):
+def _rollout_episode_impl(state_dict_cpu, cfg_dict, problem_name, dim, seed, epsilon):
     device = str(cfg_dict.get("rollout_device", "cpu"))
 
     agent = Disc(
@@ -753,6 +754,29 @@ def rollout_episode_task(state_dict_cpu, cfg_dict, problem_name, dim, seed, epsi
     }
 
 
+@ray.remote(num_cpus=1)
+def rollout_episode_task(state_dict_cpu, cfg_dict, problem_name, dim, seed, epsilon):
+    return _rollout_episode_impl(
+        state_dict_cpu=state_dict_cpu,
+        cfg_dict=cfg_dict,
+        problem_name=problem_name,
+        dim=dim,
+        seed=seed,
+        epsilon=epsilon,
+    )
+
+
+def rollout_episode_task_local(state_dict_cpu, cfg_dict, problem_name, dim, seed, epsilon):
+    return _rollout_episode_impl(
+        state_dict_cpu=state_dict_cpu,
+        cfg_dict=cfg_dict,
+        problem_name=problem_name,
+        dim=dim,
+        seed=seed,
+        epsilon=epsilon,
+    )
+
+
 def save_training_checkpoint(agent, cfg, problem_name, epoch, mean_reward, best_reward):
     os.makedirs(cfg.weight_dir, exist_ok=True)
     rs_tag = f"rs{int(cfg.reward_scheme)}"
@@ -800,6 +824,7 @@ def train_disc_ddqn_ray(
     device=None,
     rollout_device="cpu",
     surrogate_device="cpu",
+    use_ray=False,
 ):
     cfg = TrainConfig()
     cfg.reward_scheme = int(reward_scheme)
@@ -836,8 +861,12 @@ def train_disc_ddqn_ray(
         print(msg)
         log_fp.write(str(msg) + "\n")
 
-    if not ray.is_initialized():
-        ray.init(num_cpus=actual_num_workers, ignore_reinit_error=True)
+    executor = None
+    if bool(use_ray):
+        if not ray.is_initialized():
+            ray.init(num_cpus=actual_num_workers, ignore_reinit_error=True)
+    else:
+        executor = ProcessPoolExecutor(max_workers=actual_num_workers)
 
     agent = Disc(
         hidden_dim=cfg.hidden_dim,
@@ -863,6 +892,7 @@ def train_disc_ddqn_ray(
         f"reward_scheme={cfg.reward_scheme} | "
         f"policy={cfg.policy_mode} | "
         f"surrogate={cfg.surrogate_model} | "
+        f"sampling_backend={'ray' if use_ray else 'process_pool'} | "
         f"sur_steps={cfg.surrogate_nsga_steps} | "
         f"updates_per_epoch={cfg.updates_per_epoch} | "
         f"train_device={cfg.device} | "
@@ -896,19 +926,35 @@ def train_disc_ddqn_ray(
         for env_idx, spec in enumerate(env_specs):
             for ep in range(int(cfg.episodes_per_worker)):
                 seed = 100000 * epoch + 1000 * env_idx + ep
-                futures.append(
-                    rollout_episode_task.remote(
-                        state_dict_cpu=state_cpu,
-                        cfg_dict=cfg_dict,
-                        problem_name=spec["problem_name"],
-                        dim=int(spec["dim"]),
-                        seed=int(seed),
-                        epsilon=epsilon,
+                if bool(use_ray):
+                    futures.append(
+                        rollout_episode_task.remote(
+                            state_dict_cpu=state_cpu,
+                            cfg_dict=cfg_dict,
+                            problem_name=spec["problem_name"],
+                            dim=int(spec["dim"]),
+                            seed=int(seed),
+                            epsilon=epsilon,
+                        )
                     )
-                )
+                else:
+                    futures.append(
+                        executor.submit(
+                            rollout_episode_task_local,
+                            state_dict_cpu,
+                            cfg_dict,
+                            spec["problem_name"],
+                            int(spec["dim"]),
+                            int(seed),
+                            epsilon,
+                        )
+                    )
         if len(futures) == 0:
             raise ValueError("No rollout tasks were created.")
-        results = ray.get(futures)
+        if bool(use_ray):
+            results = ray.get(futures)
+        else:
+            results = [f.result() for f in futures]
 
         all_rewards = []
         per_env_stats = {}
@@ -1059,6 +1105,8 @@ def train_disc_ddqn_ray(
 
         best_reward = save_training_checkpoint(agent, cfg, cfg.heldout_problem, epoch, mean_ep_reward, best_reward)
 
+    if executor is not None:
+        executor.shutdown(wait=True)
     log_fp.close()
     return agent
 
@@ -1077,4 +1125,5 @@ if __name__ == "__main__":
         device=args.device,
         rollout_device=str(args.rollout_device),
         surrogate_device=str(args.surrogate_device),
+        use_ray=bool(args.ray),
     )

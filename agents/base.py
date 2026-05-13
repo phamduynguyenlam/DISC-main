@@ -197,15 +197,37 @@ class BaseAgent(nn.Module):
         x_sur = self._ensure_batch(x_sur).float()
         y_sur = self._ensure_batch(y_sur).float()
         sigma_sur = self._ensure_batch(sigma_sur).float()
-        if archive_mask is not None:
-            archive_mask = self._ensure_batch(torch.as_tensor(archive_mask, device=x_true.device)).bool()
-        if candidate_mask is not None:
-            candidate_mask = self._ensure_batch(torch.as_tensor(candidate_mask, device=x_true.device)).bool()
 
         device = x_true.device
         dtype = x_true.dtype
         batch_size = x_true.size(0)
         n_dim = x_true.size(-1)
+        n_archive = x_true.size(1)
+        n_candidates = x_sur.size(1)
+
+        if archive_mask is not None:
+            archive_mask = torch.as_tensor(archive_mask, device=device, dtype=torch.bool)
+            if archive_mask.dim() == 1:
+                archive_mask = archive_mask.view(1, -1).expand(batch_size, -1)
+            elif archive_mask.dim() == 2:
+                if archive_mask.size(0) != batch_size:
+                    raise ValueError(f"archive_mask batch size mismatch: {archive_mask.size(0)} vs {batch_size}")
+            else:
+                raise ValueError(f"Unsupported archive_mask shape: {tuple(archive_mask.shape)}")
+            if archive_mask.size(1) != n_archive:
+                raise ValueError(f"archive_mask width mismatch: {archive_mask.size(1)} vs {n_archive}")
+
+        if candidate_mask is not None:
+            candidate_mask = torch.as_tensor(candidate_mask, device=device, dtype=torch.bool)
+            if candidate_mask.dim() == 1:
+                candidate_mask = candidate_mask.view(1, -1).expand(batch_size, -1)
+            elif candidate_mask.dim() == 2:
+                if candidate_mask.size(0) != batch_size:
+                    raise ValueError(f"candidate_mask batch size mismatch: {candidate_mask.size(0)} vs {batch_size}")
+            else:
+                raise ValueError(f"Unsupported candidate_mask shape: {tuple(candidate_mask.shape)}")
+            if candidate_mask.size(1) != n_candidates:
+                raise ValueError(f"candidate_mask width mismatch: {candidate_mask.size(1)} vs {n_candidates}")
 
         lower = torch.as_tensor(lower_bound, device=device, dtype=dtype)
         upper = torch.as_tensor(upper_bound, device=device, dtype=dtype)
