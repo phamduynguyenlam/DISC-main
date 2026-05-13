@@ -184,10 +184,11 @@ class Disc(BaseAgent):
         progress,
         lower_bound,
         upper_bound,
+        archive_mask=None,
+        candidate_mask=None,
         target_ranking=None,
         decode_type="epsilon_greedy",
         max_decode_steps=None,
-        candidate_mask=None,
         epsilon=None,
     ):
         encoded = self.encode(
@@ -199,6 +200,8 @@ class Disc(BaseAgent):
             progress=progress,
             lower_bound=lower_bound,
             upper_bound=upper_bound,
+            archive_mask=archive_mask,
+            candidate_mask=candidate_mask,
         )
 
         decoded = self.decode_ranking(

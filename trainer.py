@@ -243,23 +243,148 @@ def build_offspring_sigma(archive_x, archive_y, offspring_x, surrogate):
     return local_sigma.astype(np.float32)
 
 
-def pad_stack_rows(arrays, pad_value=0.0, mode="repeat_last"):
+def pad_stack_rows(arrays, pad_value=0.0):
     arrays = [np.asarray(arr, dtype=np.float32) for arr in arrays]
-    max_rows = max(int(arr.shape[0]) for arr in arrays)
-    padded = []
+    if len(arrays) == 0:
+        raise ValueError("arrays must be non-empty.")
+
+    max_ndim = max(arr.ndim for arr in arrays)
+    normalized = []
     for arr in arrays:
-        n_rows = int(arr.shape[0])
-        if n_rows == max_rows:
+        if arr.ndim < max_ndim:
+            new_shape = arr.shape + (1,) * (max_ndim - arr.ndim)
+            arr = arr.reshape(new_shape)
+        normalized.append(arr)
+
+    target_shape = tuple(
+        max(int(arr.shape[axis]) for arr in normalized)
+        for axis in range(max_ndim)
+    )
+
+    padded = []
+    for arr in normalized:
+        if arr.shape == target_shape:
             padded.append(arr)
             continue
-        n_pad = max_rows - n_rows
-        if mode == "repeat_last" and n_rows > 0:
-            pad = np.repeat(arr[-1:, :], n_pad, axis=0)
-        else:
-            pad_shape = (n_pad,) + arr.shape[1:]
-            pad = np.full(pad_shape, pad_value, dtype=np.float32)
-        padded.append(np.concatenate([arr, pad], axis=0))
+
+        out = np.full(target_shape, pad_value, dtype=np.float32)
+        slices = tuple(slice(0, int(size)) for size in arr.shape)
+        out[slices] = arr
+        padded.append(out)
+
     return np.stack(padded, axis=0)
+
+
+def build_row_mask(arrays):
+    arrays = [np.asarray(arr) for arr in arrays]
+    max_rows = max(int(arr.shape[0]) for arr in arrays)
+    mask = np.zeros((len(arrays), max_rows), dtype=bool)
+    for i, arr in enumerate(arrays):
+        mask[i, : int(arr.shape[0])] = True
+    return mask
+
+
+def _compute_ddqn_loss_same_objectives(agent, target_agent, batch, cfg):
+    (
+        x_true,
+        y_true,
+        x_sur,
+        y_sur,
+        sigma_sur,
+        progress,
+        lower_bound,
+        upper_bound,
+        actions,
+        rewards,
+        next_x_true,
+        next_y_true,
+        next_x_sur,
+        next_y_sur,
+        next_sigma_sur,
+        next_progress,
+        dones,
+    ) = batch
+
+    device = cfg.device
+    archive_mask = to_tensor(build_row_mask(x_true), device)
+    candidate_mask = to_tensor(build_row_mask(x_sur), device)
+    next_archive_mask = to_tensor(build_row_mask(next_x_true), device)
+    next_candidate_mask = to_tensor(build_row_mask(next_x_sur), device)
+
+    x_true = to_tensor(pad_stack_rows(x_true), device)
+    y_true = to_tensor(pad_stack_rows(y_true), device)
+    x_sur = to_tensor(pad_stack_rows(x_sur), device)
+    y_sur = to_tensor(pad_stack_rows(y_sur), device)
+    sigma_sur = to_tensor(pad_stack_rows(sigma_sur), device)
+    progress = to_tensor(np.asarray(progress).reshape(-1, 1), device)
+
+    lower_bound = to_tensor(pad_stack_rows(lower_bound).squeeze(-1), device)
+    upper_bound = to_tensor(pad_stack_rows(upper_bound).squeeze(-1), device)
+
+    actions = torch.tensor(actions, dtype=torch.long, device=device)
+    rewards = torch.tensor(rewards, dtype=torch.float32, device=device)
+    dones = torch.tensor(dones, dtype=torch.float32, device=device)
+
+    next_x_true = to_tensor(pad_stack_rows(next_x_true), device)
+    next_y_true = to_tensor(pad_stack_rows(next_y_true), device)
+    next_x_sur = to_tensor(pad_stack_rows(next_x_sur), device)
+    next_y_sur = to_tensor(pad_stack_rows(next_y_sur), device)
+    next_sigma_sur = to_tensor(pad_stack_rows(next_sigma_sur), device)
+    next_progress = to_tensor(np.asarray(next_progress).reshape(-1, 1), device)
+
+    out = agent(
+        x_true=x_true,
+        y_true=y_true,
+        x_sur=x_sur,
+        y_sur=y_sur,
+        sigma_sur=sigma_sur,
+        progress=progress,
+        lower_bound=lower_bound,
+        upper_bound=upper_bound,
+        archive_mask=archive_mask,
+        candidate_mask=candidate_mask,
+        decode_type="q_greedy",
+    )
+
+    q_values = out["q_values"]
+    q_sa = q_values.gather(1, actions.view(-1, 1)).squeeze(1)
+
+    with torch.no_grad():
+        next_online = agent(
+            x_true=next_x_true,
+            y_true=next_y_true,
+            x_sur=next_x_sur,
+            y_sur=next_y_sur,
+            sigma_sur=next_sigma_sur,
+            progress=next_progress,
+            lower_bound=lower_bound,
+            upper_bound=upper_bound,
+            archive_mask=next_archive_mask,
+            candidate_mask=next_candidate_mask,
+            decode_type="q_greedy",
+        )
+
+        next_actions = torch.argmax(next_online["q_values"], dim=1)
+
+        next_target = target_agent(
+            x_true=next_x_true,
+            y_true=next_y_true,
+            x_sur=next_x_sur,
+            y_sur=next_y_sur,
+            sigma_sur=next_sigma_sur,
+            progress=next_progress,
+            lower_bound=lower_bound,
+            upper_bound=upper_bound,
+            archive_mask=next_archive_mask,
+            candidate_mask=next_candidate_mask,
+            decode_type="q_greedy",
+        )
+
+        next_q = next_target["q_values"].gather(1, next_actions.view(-1, 1)).squeeze(1)
+        target = rewards + cfg.gamma * next_q * (1.0 - dones)
+
+    loss = nn.SmoothL1Loss()(q_sa, target)
+    return loss, q_sa.detach().mean().item(), rewards.mean().item(), len(x_true)
 
 
 def compute_ddqn_loss(agent, target_agent, batch, cfg):
@@ -283,76 +408,59 @@ def compute_ddqn_loss(agent, target_agent, batch, cfg):
         dones,
     ) = batch
 
-    device = cfg.device
+    objective_counts = [int(np.asarray(arr).shape[1]) for arr in y_true]
+    groups = {}
+    for idx, n_obj in enumerate(objective_counts):
+        groups.setdefault(n_obj, []).append(idx)
 
-    x_true = to_tensor(pad_stack_rows(x_true), device)
-    y_true = to_tensor(pad_stack_rows(y_true), device)
-    x_sur = to_tensor(pad_stack_rows(x_sur), device)
-    y_sur = to_tensor(pad_stack_rows(y_sur), device)
-    sigma_sur = to_tensor(pad_stack_rows(sigma_sur), device)
-    progress = to_tensor(np.asarray(progress).reshape(-1, 1), device)
+    total_count = 0
+    total_q_mean = 0.0
+    total_r_mean = 0.0
+    weighted_loss = None
 
-    lower_bound = to_tensor(np.stack(lower_bound), device)
-    upper_bound = to_tensor(np.stack(upper_bound), device)
+    batch_items = [
+        x_true,
+        y_true,
+        x_sur,
+        y_sur,
+        sigma_sur,
+        progress,
+        lower_bound,
+        upper_bound,
+        actions,
+        rewards,
+        next_x_true,
+        next_y_true,
+        next_x_sur,
+        next_y_sur,
+        next_sigma_sur,
+        next_progress,
+        dones,
+    ]
 
-    actions = torch.tensor(actions, dtype=torch.long, device=device)
-    rewards = torch.tensor(rewards, dtype=torch.float32, device=device)
-    dones = torch.tensor(dones, dtype=torch.float32, device=device)
+    for indices in groups.values():
+        subbatch = []
+        for item in batch_items:
+            subbatch.append([item[i] for i in indices])
 
-    next_x_true = to_tensor(pad_stack_rows(next_x_true), device)
-    next_y_true = to_tensor(pad_stack_rows(next_y_true), device)
-    next_x_sur = to_tensor(pad_stack_rows(next_x_sur), device)
-    next_y_sur = to_tensor(pad_stack_rows(next_y_sur), device)
-    next_sigma_sur = to_tensor(pad_stack_rows(next_sigma_sur), device)
-    next_progress = to_tensor(np.asarray(next_progress).reshape(-1, 1), device)
-
-    out = agent(
-        x_true=x_true,
-        y_true=y_true,
-        x_sur=x_sur,
-        y_sur=y_sur,
-        sigma_sur=sigma_sur,
-        progress=progress,
-        lower_bound=lower_bound,
-        upper_bound=upper_bound,
-        decode_type="q_greedy",
-    )
-
-    q_values = out["q_values"]
-    q_sa = q_values.gather(1, actions.view(-1, 1)).squeeze(1)
-
-    with torch.no_grad():
-        next_online = agent(
-            x_true=next_x_true,
-            y_true=next_y_true,
-            x_sur=next_x_sur,
-            y_sur=next_y_sur,
-            sigma_sur=next_sigma_sur,
-            progress=next_progress,
-            lower_bound=lower_bound,
-            upper_bound=upper_bound,
-            decode_type="q_greedy",
+        group_loss, group_q_mean, group_r_mean, group_count = _compute_ddqn_loss_same_objectives(
+            agent=agent,
+            target_agent=target_agent,
+            batch=tuple(subbatch),
+            cfg=cfg,
         )
 
-        next_actions = torch.argmax(next_online["q_values"], dim=1)
+        total_count += int(group_count)
+        total_q_mean += float(group_q_mean) * float(group_count)
+        total_r_mean += float(group_r_mean) * float(group_count)
 
-        next_target = target_agent(
-            x_true=next_x_true,
-            y_true=next_y_true,
-            x_sur=next_x_sur,
-            y_sur=next_y_sur,
-            sigma_sur=next_sigma_sur,
-            progress=next_progress,
-            lower_bound=lower_bound,
-            upper_bound=upper_bound,
-            decode_type="q_greedy",
-        )
+        scaled_loss = group_loss * (float(group_count) / float(len(objective_counts)))
+        weighted_loss = scaled_loss if weighted_loss is None else (weighted_loss + scaled_loss)
 
-        next_q = next_target["q_values"].gather(1, next_actions.view(-1, 1)).squeeze(1)
-        target = rewards + cfg.gamma * next_q * (1.0 - dones)
+    if weighted_loss is None or total_count <= 0:
+        raise ValueError("Failed to build objective-shape groups for DDQN loss.")
 
-    loss = nn.SmoothL1Loss()(q_sa, target)
-    return loss, q_sa.detach().mean().item(), rewards.mean().item()
+    return weighted_loss, total_q_mean / total_count, total_r_mean / total_count
 
 
 def compute_env_reward(previous_archive_y, selected_y, ref_point, reward_scheme_id):

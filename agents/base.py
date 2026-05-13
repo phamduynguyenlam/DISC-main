@@ -38,8 +38,14 @@ class TsAttnBlock(nn.Module):
         self.norm2 = nn.LayerNorm(hidden_dim)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x):
-        attn_out, _ = self.attn(x, x, x, need_weights=False)
+    def forward(self, x, key_padding_mask=None):
+        attn_out, _ = self.attn(
+            x,
+            x,
+            x,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
         x = self.norm1(x + self.dropout(attn_out))
         ff_out = self.ff(x)
         return self.norm2(x + self.dropout(ff_out))
@@ -52,19 +58,37 @@ class LandscapeEncoder(nn.Module):
         self.cross_dimension = TsAttnBlock(hidden_dim, n_heads, ff_dim, dropout)
         self.position = PositionalEncoding(hidden_dim)
 
-    def forward(self, x):
+    def forward(self, x, dim_mask=None, individual_mask=None):
         bsz, n_obj, n_dim, n_ind, hidden_dim = x.shape
 
         x = x.reshape(bsz * n_obj * n_dim, n_ind, hidden_dim)
-        x = self.cross_individual(x)
+        individual_padding_mask = None
+        if individual_mask is not None:
+            individual_mask = individual_mask.to(device=x.device, dtype=torch.bool)
+            individual_padding_mask = (~individual_mask).unsqueeze(1).unsqueeze(1)
+            individual_padding_mask = individual_padding_mask.expand(-1, n_obj, n_dim, -1)
+            individual_padding_mask = individual_padding_mask.reshape(bsz * n_obj * n_dim, n_ind)
+        x = self.cross_individual(x, key_padding_mask=individual_padding_mask)
         x = x.reshape(bsz, n_obj, n_dim, n_ind, hidden_dim)
 
         x = x.permute(0, 1, 3, 2, 4).reshape(bsz * n_obj * n_ind, n_dim, hidden_dim)
         x = self.position(x)
-        x = self.cross_dimension(x)
+        dim_padding_mask = None
+        if dim_mask is not None:
+            dim_mask = dim_mask.to(device=x.device, dtype=torch.bool)
+            dim_padding_mask = (~dim_mask).unsqueeze(1).unsqueeze(1)
+            dim_padding_mask = dim_padding_mask.expand(-1, n_obj, n_ind, -1)
+            dim_padding_mask = dim_padding_mask.reshape(bsz * n_obj * n_ind, n_dim)
+        x = self.cross_dimension(x, key_padding_mask=dim_padding_mask)
         x = x.reshape(bsz, n_obj, n_ind, n_dim, hidden_dim)
 
-        return x.mean(dim=3)
+        if dim_mask is None:
+            return x.mean(dim=3)
+
+        dim_mask_expanded = dim_mask.to(device=x.device, dtype=x.dtype).view(bsz, 1, 1, n_dim, 1)
+        masked_sum = (x * dim_mask_expanded).sum(dim=3)
+        denom = dim_mask_expanded.sum(dim=3).clamp_min(1.0)
+        return masked_sum / denom
 
 
 class CrossSpaceAttention(nn.Module):
@@ -86,8 +110,14 @@ class CrossSpaceAttention(nn.Module):
         self.norm2 = nn.LayerNorm(hidden_dim)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, query, key, value):
-        attn_out, _ = self.attn(query, key, value, need_weights=False)
+    def forward(self, query, key, value, key_padding_mask=None):
+        attn_out, _ = self.attn(
+            query,
+            key,
+            value,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
         x = self.norm1(query + self.dropout(attn_out))
         ff_out = self.ff(x)
         return self.norm2(x + self.dropout(ff_out))
@@ -159,25 +189,51 @@ class BaseAgent(nn.Module):
         sigma_sur,
         lower_bound,
         upper_bound,
+        archive_mask=None,
+        candidate_mask=None,
     ):
         x_true = self._ensure_batch(x_true).float()
         y_true = self._ensure_batch(y_true).float()
         x_sur = self._ensure_batch(x_sur).float()
         y_sur = self._ensure_batch(y_sur).float()
         sigma_sur = self._ensure_batch(sigma_sur).float()
+        if archive_mask is not None:
+            archive_mask = self._ensure_batch(torch.as_tensor(archive_mask, device=x_true.device)).bool()
+        if candidate_mask is not None:
+            candidate_mask = self._ensure_batch(torch.as_tensor(candidate_mask, device=x_true.device)).bool()
 
         device = x_true.device
         dtype = x_true.dtype
+        batch_size = x_true.size(0)
+        n_dim = x_true.size(-1)
+
         lower = torch.as_tensor(lower_bound, device=device, dtype=dtype)
         upper = torch.as_tensor(upper_bound, device=device, dtype=dtype)
 
         if lower.dim() == 0:
-            lower = lower.repeat(x_true.size(-1))
-        if upper.dim() == 0:
-            upper = upper.repeat(x_true.size(-1))
+            lower = lower.repeat(n_dim).view(1, n_dim).expand(batch_size, -1)
+        elif lower.dim() == 1:
+            lower = lower.view(1, -1).expand(batch_size, -1)
+        elif lower.dim() == 2:
+            if lower.size(0) != batch_size:
+                raise ValueError(f"lower_bound batch size mismatch: {lower.size(0)} vs {batch_size}")
+        else:
+            raise ValueError(f"Unsupported lower_bound shape: {tuple(lower.shape)}")
 
-        lower = lower.view(1, 1, -1)
-        upper = upper.view(1, 1, -1)
+        if upper.dim() == 0:
+            upper = upper.repeat(n_dim).view(1, n_dim).expand(batch_size, -1)
+        elif upper.dim() == 1:
+            upper = upper.view(1, -1).expand(batch_size, -1)
+        elif upper.dim() == 2:
+            if upper.size(0) != batch_size:
+                raise ValueError(f"upper_bound batch size mismatch: {upper.size(0)} vs {batch_size}")
+        else:
+            raise ValueError(f"Unsupported upper_bound shape: {tuple(upper.shape)}")
+
+        dim_mask = (upper - lower).abs() > 1e-12
+
+        lower = lower.unsqueeze(1)
+        upper = upper.unsqueeze(1)
 
         x_true = self._normalize_by_range(x_true, lower, upper)
         x_sur = self._normalize_by_range(x_sur, lower, upper)
@@ -198,7 +254,22 @@ class BaseAgent(nn.Module):
         sigma_expand = sigma_expand.expand(-1, -1, x_sur.size(-1), -1, -1)
         m_surr = torch.cat((x_sur_expand, y_sur_expand, sigma_expand), dim=-1)
 
-        return m_true, m_surr
+        if archive_mask is None:
+            archive_mask = torch.ones(
+                x_true.size(0),
+                x_true.size(1),
+                device=device,
+                dtype=torch.bool,
+            )
+        if candidate_mask is None:
+            candidate_mask = torch.ones(
+                x_sur.size(0),
+                x_sur.size(1),
+                device=device,
+                dtype=torch.bool,
+            )
+
+        return m_true, m_surr, dim_mask, archive_mask, candidate_mask
 
     def encode(
         self,
@@ -210,8 +281,10 @@ class BaseAgent(nn.Module):
         progress,
         lower_bound,
         upper_bound,
+        archive_mask=None,
+        candidate_mask=None,
     ):
-        m_true, m_surr = self._prepare_inputs(
+        m_true, m_surr, dim_mask, archive_mask, candidate_mask = self._prepare_inputs(
             x_true=x_true,
             y_true=y_true,
             x_sur=x_sur,
@@ -219,17 +292,24 @@ class BaseAgent(nn.Module):
             sigma_sur=sigma_sur,
             lower_bound=lower_bound,
             upper_bound=upper_bound,
+            archive_mask=archive_mask,
+            candidate_mask=candidate_mask,
         )
 
         e_true = self.W_true(m_true)
         e_surr = self.W_surr(m_surr)
 
-        s_true = self.encoder_true(e_true)
-        s_surr = self.encoder_surr(e_surr)
+        s_true = self.encoder_true(e_true, dim_mask=dim_mask, individual_mask=archive_mask)
+        s_surr = self.encoder_surr(e_surr, dim_mask=dim_mask, individual_mask=candidate_mask)
 
         h_true = s_true.mean(dim=1)
         h_surr_raw = s_surr.mean(dim=1)
-        h_surr = self.cross_space_attn(h_surr_raw, h_true, h_true)
+        h_surr = self.cross_space_attn(
+            h_surr_raw,
+            h_true,
+            h_true,
+            key_padding_mask=(~archive_mask),
+        )
 
         progress = self._prepare_progress(
             progress=progress,
