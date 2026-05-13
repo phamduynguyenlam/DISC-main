@@ -59,6 +59,7 @@ class TrainConfig:
     kan_hidden_width: int = 64
     kan_grid: int = 5
     reward_scheme: int = 1
+    policy_mode: str = "epsilon_greedy"
     training_set: int = 1
     heldout_problem: str = "ZDT1"
     weight_dir: str = "weight"
@@ -710,7 +711,7 @@ def rollout_episode_task(state_dict_cpu, cfg_dict, problem_name, dim, seed, epsi
                 progress=to_tensor(state["progress"].reshape(1, 1), device),
                 lower_bound=to_tensor(state["lower_bound"][None, ...], device),
                 upper_bound=to_tensor(state["upper_bound"][None, ...], device),
-                decode_type="epsilon_greedy",
+                decode_type=str(cfg_dict.get("policy_mode", "epsilon_greedy")),
                 epsilon=epsilon,
             )
 
@@ -844,6 +845,7 @@ def train_disc_ddqn_ray(
         f"envs={len(env_specs)} | "
         f"workers={actual_num_workers} | "
         f"reward_scheme={cfg.reward_scheme} | "
+        f"policy={cfg.policy_mode} | "
         f"surrogate={cfg.surrogate_model} | "
         f"sur_steps={cfg.surrogate_nsga_steps} | "
         f"train_device={cfg.device} | "
@@ -945,8 +947,9 @@ def train_disc_ddqn_ray(
             print(
                 f"epoch {epoch} done | mean reward = {mean_ep_reward:.4f} | "
                 f"set = {cfg.training_set} | heldout = {cfg.heldout_problem} | "
-                f"surrogate = {cfg.surrogate_model} | sur_steps = {cfg.surrogate_nsga_steps} | "
-                f"workers = {actual_num_workers} | replay = {len(replay)} | update = skipped"
+            f"surrogate = {cfg.surrogate_model} | sur_steps = {cfg.surrogate_nsga_steps} | "
+            f"workers = {actual_num_workers} | replay = {len(replay)} | "
+            f"reward_scheme = {cfg.reward_scheme} | policy = {cfg.policy_mode} | update = skipped"
                 f" | td_loss = nan | grad_norm = nan | q_mean = {empty_metrics['q_mean']} | "
                 f"q_std = {empty_metrics['q_std']} | target_mean = {empty_metrics['target_mean']} | "
                 f"td_error_mean = {empty_metrics['td_error_mean']} | "
@@ -1003,6 +1006,7 @@ def train_disc_ddqn_ray(
             f"set = {cfg.training_set} | heldout = {cfg.heldout_problem} | "
             f"surrogate = {cfg.surrogate_model} | sur_steps = {cfg.surrogate_nsga_steps} | "
             f"workers = {actual_num_workers} | replay = {len(replay)} | "
+            f"reward_scheme = {cfg.reward_scheme} | policy = {cfg.policy_mode} | "
             f"td_loss = {loss.item():.6f} | grad_norm = {grad_norm:.6f} | "
             f"q_mean = {ddqn_metrics['q_mean']:.4f} | q_std = {ddqn_metrics['q_std']:.4f} | "
             f"target_mean = {ddqn_metrics['target_mean']:.4f} | "
