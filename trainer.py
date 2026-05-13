@@ -941,7 +941,7 @@ def train_disc_ddqn_ray(
                     futures.append(
                         executor.submit(
                             rollout_episode_task_local,
-                            state_dict_cpu,
+                            state_cpu,
                             cfg_dict,
                             spec["problem_name"],
                             int(spec["dim"]),
