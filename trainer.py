@@ -44,6 +44,7 @@ class TrainConfig:
     lr: float = 1e-4
     target_update_interval: int = 20
     train_iters: int = 50
+    updates_per_epoch: int = 1
     epsilon_start: float = 0.3
     epsilon_end: float = 0.05
     epsilon_decay_iters: int = 1000
@@ -113,6 +114,7 @@ def parse_args():
     parser.add_argument("--training_set", type=int, default=1, choices=[1, 2, 3])
     parser.add_argument("--num_workers", type=int, default=None)
     parser.add_argument("--surrogate_nsga_steps", type=int, default=100)
+    parser.add_argument("--updates_per_epoch", type=int, default=1)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--rollout_device", type=str, default="cpu")
     parser.add_argument("--surrogate_device", type=str, default="cpu")
@@ -793,6 +795,7 @@ def train_disc_ddqn_ray(
     training_set=1,
     num_workers=None,
     surrogate_nsga_steps=100,
+    updates_per_epoch=1,
     device=None,
     rollout_device="cpu",
     surrogate_device="cpu",
@@ -803,6 +806,7 @@ def train_disc_ddqn_ray(
     cfg.training_set = int(training_set)
     cfg.heldout_problem = str(problem_name).upper()
     cfg.surrogate_nsga_steps = int(surrogate_nsga_steps)
+    cfg.updates_per_epoch = int(updates_per_epoch)
     if device is not None:
         cfg.device = str(device)
     cfg.rollout_device = str(rollout_device)
@@ -848,6 +852,7 @@ def train_disc_ddqn_ray(
         f"policy={cfg.policy_mode} | "
         f"surrogate={cfg.surrogate_model} | "
         f"sur_steps={cfg.surrogate_nsga_steps} | "
+        f"updates_per_epoch={cfg.updates_per_epoch} | "
         f"train_device={cfg.device} | "
         f"rollout_device={cfg.rollout_device} | "
         f"surrogate_device={cfg.surrogate_device} | "
@@ -960,18 +965,39 @@ def train_disc_ddqn_ray(
             best_reward = save_training_checkpoint(agent, cfg, cfg.heldout_problem, epoch, mean_ep_reward, best_reward)
             continue
 
-        batch = replay.sample(cfg.batch_size)
-
+        update_metrics_list = []
         agent.train()
-        loss, ddqn_metrics = compute_ddqn_loss(agent, target_agent, batch, cfg)
+        for update_idx in range(int(cfg.updates_per_epoch)):
+            batch = replay.sample(cfg.batch_size)
+            loss, ddqn_metrics = compute_ddqn_loss(agent, target_agent, batch, cfg)
 
-        optimizer.zero_grad()
-        loss.backward()
-        grad_norm = float(torch.nn.utils.clip_grad_norm_(agent.parameters(), 1.0))
-        optimizer.step()
+            optimizer.zero_grad()
+            loss.backward()
+            grad_norm = float(torch.nn.utils.clip_grad_norm_(agent.parameters(), 1.0))
+            optimizer.step()
+
+            update_metrics = {
+                "td_loss": float(loss.item()),
+                "grad_norm": float(grad_norm),
+                "q_mean": float(ddqn_metrics["q_mean"]),
+                "q_std": float(ddqn_metrics["q_std"]),
+                "target_mean": float(ddqn_metrics["target_mean"]),
+                "td_error_mean": float(ddqn_metrics["td_error_mean"]),
+                "td_error_std": float(ddqn_metrics["td_error_std"]),
+                "reward_mean": float(ddqn_metrics["reward_mean"]),
+                "shape_group": int(ddqn_metrics["shape_group"]),
+                "group_sizes": list(ddqn_metrics["group_sizes"]),
+            }
+            update_metrics_list.append(update_metrics)
 
         if it % cfg.target_update_interval == 0:
             target_agent.load_state_dict(agent.state_dict())
+
+        mean_update_metrics = {}
+        for key in ["td_loss", "grad_norm", "q_mean", "q_std", "target_mean", "td_error_mean", "td_error_std", "reward_mean"]:
+            mean_update_metrics[key] = float(np.mean([m[key] for m in update_metrics_list]))
+        mean_update_metrics["shape_group"] = int(round(np.mean([m["shape_group"] for m in update_metrics_list])))
+        mean_update_metrics["group_sizes"] = [m["group_sizes"] for m in update_metrics_list]
 
         print(
             f"[Epoch {epoch:04d}] "
@@ -980,18 +1006,19 @@ def train_disc_ddqn_ray(
             f"envs_active={len(env_specs)}/{len(env_specs)} | "
             f"surrogate={cfg.surrogate_model} | "
             f"sur_steps={cfg.surrogate_nsga_steps} | "
+            f"updates={cfg.updates_per_epoch} | "
             f"eps={epsilon:.3f} | "
             f"replay={len(replay)} | "
-            f"td_loss={loss.item():.6f} | "
-            f"grad_norm={grad_norm:.6f} | "
-            f"q_mean={ddqn_metrics['q_mean']:.4f} | "
-            f"q_std={ddqn_metrics['q_std']:.4f} | "
-            f"target_mean={ddqn_metrics['target_mean']:.4f} | "
-            f"td_error_mean={ddqn_metrics['td_error_mean']:.4f} | "
-            f"td_error_std={ddqn_metrics['td_error_std']:.4f} | "
-            f"shape_group={ddqn_metrics['shape_group']} | "
-            f"group_sizes={ddqn_metrics['group_sizes']} | "
-            f"batch_r={ddqn_metrics['reward_mean']:.4f} | "
+            f"td_loss={mean_update_metrics['td_loss']:.6f} | "
+            f"grad_norm={mean_update_metrics['grad_norm']:.6f} | "
+            f"q_mean={mean_update_metrics['q_mean']:.4f} | "
+            f"q_std={mean_update_metrics['q_std']:.4f} | "
+            f"target_mean={mean_update_metrics['target_mean']:.4f} | "
+            f"td_error_mean={mean_update_metrics['td_error_mean']:.4f} | "
+            f"td_error_std={mean_update_metrics['td_error_std']:.4f} | "
+            f"shape_group={mean_update_metrics['shape_group']} | "
+            f"group_sizes={mean_update_metrics['group_sizes']} | "
+            f"batch_r={mean_update_metrics['reward_mean']:.4f} | "
             f"ep_return={mean_ep_reward:.4f}"
         )
         for key, stats in per_env_summaries.items():
@@ -1007,13 +1034,14 @@ def train_disc_ddqn_ray(
             f"surrogate = {cfg.surrogate_model} | sur_steps = {cfg.surrogate_nsga_steps} | "
             f"workers = {actual_num_workers} | replay = {len(replay)} | "
             f"reward_scheme = {cfg.reward_scheme} | policy = {cfg.policy_mode} | "
-            f"td_loss = {loss.item():.6f} | grad_norm = {grad_norm:.6f} | "
-            f"q_mean = {ddqn_metrics['q_mean']:.4f} | q_std = {ddqn_metrics['q_std']:.4f} | "
-            f"target_mean = {ddqn_metrics['target_mean']:.4f} | "
-            f"td_error_mean = {ddqn_metrics['td_error_mean']:.4f} | "
-            f"td_error_std = {ddqn_metrics['td_error_std']:.4f} | "
-            f"shape_group = {ddqn_metrics['shape_group']} | "
-            f"group_sizes = {ddqn_metrics['group_sizes']}"
+            f"updates = {len(update_metrics_list)} | "
+            f"td_loss = {mean_update_metrics['td_loss']:.6f} | grad_norm = {mean_update_metrics['grad_norm']:.6f} | "
+            f"q_mean = {mean_update_metrics['q_mean']:.4f} | q_std = {mean_update_metrics['q_std']:.4f} | "
+            f"target_mean = {mean_update_metrics['target_mean']:.4f} | "
+            f"td_error_mean = {mean_update_metrics['td_error_mean']:.4f} | "
+            f"td_error_std = {mean_update_metrics['td_error_std']:.4f} | "
+            f"shape_group = {mean_update_metrics['shape_group']} | "
+            f"group_sizes = {mean_update_metrics['group_sizes']}"
         )
 
         best_reward = save_training_checkpoint(agent, cfg, cfg.heldout_problem, epoch, mean_ep_reward, best_reward)
@@ -1031,6 +1059,7 @@ if __name__ == "__main__":
         training_set=int(args.training_set),
         num_workers=args.num_workers,
         surrogate_nsga_steps=int(args.surrogate_nsga_steps),
+        updates_per_epoch=int(args.updates_per_epoch),
         device=args.device,
         rollout_device=str(args.rollout_device),
         surrogate_device=str(args.surrogate_device),
