@@ -15,7 +15,7 @@ from agents.disc import Disc
 from nsga2_solver import run_surrogate_nsga2
 from problem.problem import make_problem
 from ref_points_hv import get_reference_point
-from reward import pareto_front, reward_scheme_1, reward_scheme_2, reward_scheme_3
+from reward import hypervolume, pareto_front, reward_scheme_1, reward_scheme_2, reward_scheme_3
 from surrogate.surrogate_model import (
     estimate_uncertainty,
     fit_gp_surrogates,
@@ -63,6 +63,8 @@ class TrainConfig:
     heldout_problem: str = "ZDT1"
     weight_dir: str = "weight"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    rollout_device: str = "cpu"
+    surrogate_device: str = "cpu"
 
 
 class ReplayBuffer:
@@ -110,6 +112,9 @@ def parse_args():
     parser.add_argument("--training_set", type=int, default=1, choices=[1, 2, 3])
     parser.add_argument("--num_workers", type=int, default=None)
     parser.add_argument("--surrogate_nsga_steps", type=int, default=100)
+    parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--rollout_device", type=str, default="cpu")
+    parser.add_argument("--surrogate_device", type=str, default="cpu")
     return parser.parse_args()
 
 
@@ -147,6 +152,7 @@ def latin_hypercube_sample(n_samples, dim, lower, upper, seed):
 
 def build_surrogate_from_cfg(cfg_dict, archive_x, archive_y):
     surrogate_name = str(cfg_dict.get("surrogate_model", "gp")).lower()
+    surrogate_device = str(cfg_dict.get("surrogate_device", cfg_dict.get("device", "cpu")))
 
     if surrogate_name == "gp":
         gp_models = fit_gp_surrogates(
@@ -171,19 +177,19 @@ def build_surrogate_from_cfg(cfg_dict, archive_x, archive_y):
         models = fit_kan_surrogates(
             archive_x=np.asarray(archive_x, dtype=np.float32),
             archive_y=np.asarray(archive_y, dtype=np.float32),
-            device=str(cfg_dict.get("device", "cpu")),
+            device=surrogate_device,
             kan_steps=int(cfg_dict.get("kan_steps", 100)),
             hidden_width=int(cfg_dict.get("kan_hidden_width", 64)),
             grid=int(cfg_dict.get("kan_grid", 5)),
             seed=int(cfg_dict.get("seed", 0)),
         )
-        return KANSurrogateModel(models=models, device=str(cfg_dict.get("device", "cpu")))
+        return KANSurrogateModel(models=models, device=surrogate_device)
 
     if surrogate_name == "tabpfn":
         return fit_tabpfn_surrogate(
             archive_x=np.asarray(archive_x, dtype=np.float32),
             archive_y=np.asarray(archive_y, dtype=np.float32),
-            device=str(cfg_dict.get("device", "cpu")),
+            device=surrogate_device,
         )
 
     raise ValueError(f"Unsupported surrogate_model: {surrogate_name}")
@@ -383,8 +389,17 @@ def _compute_ddqn_loss_same_objectives(agent, target_agent, batch, cfg):
         next_q = next_target["q_values"].gather(1, next_actions.view(-1, 1)).squeeze(1)
         target = rewards + cfg.gamma * next_q * (1.0 - dones)
 
+    td_error = q_sa - target
     loss = nn.SmoothL1Loss()(q_sa, target)
-    return loss, q_sa.detach().mean().item(), rewards.mean().item(), len(x_true)
+    metrics = {
+        "q_mean": q_sa.detach().mean().item(),
+        "q_std": q_sa.detach().std(unbiased=False).item() if q_sa.numel() > 1 else 0.0,
+        "target_mean": target.detach().mean().item(),
+        "td_error_mean": td_error.detach().mean().item(),
+        "td_error_std": td_error.detach().std(unbiased=False).item() if td_error.numel() > 1 else 0.0,
+        "reward_mean": rewards.mean().item(),
+    }
+    return loss, metrics, len(x_true)
 
 
 def compute_ddqn_loss(agent, target_agent, batch, cfg):
@@ -415,8 +430,13 @@ def compute_ddqn_loss(agent, target_agent, batch, cfg):
 
     total_count = 0
     total_q_mean = 0.0
+    total_q_std = 0.0
+    total_target_mean = 0.0
+    total_td_error_mean = 0.0
+    total_td_error_std = 0.0
     total_r_mean = 0.0
     weighted_loss = None
+    group_sizes = []
 
     batch_items = [
         x_true,
@@ -443,7 +463,7 @@ def compute_ddqn_loss(agent, target_agent, batch, cfg):
         for item in batch_items:
             subbatch.append([item[i] for i in indices])
 
-        group_loss, group_q_mean, group_r_mean, group_count = _compute_ddqn_loss_same_objectives(
+        group_loss, group_metrics, group_count = _compute_ddqn_loss_same_objectives(
             agent=agent,
             target_agent=target_agent,
             batch=tuple(subbatch),
@@ -451,8 +471,13 @@ def compute_ddqn_loss(agent, target_agent, batch, cfg):
         )
 
         total_count += int(group_count)
-        total_q_mean += float(group_q_mean) * float(group_count)
-        total_r_mean += float(group_r_mean) * float(group_count)
+        group_sizes.append(int(group_count))
+        total_q_mean += float(group_metrics["q_mean"]) * float(group_count)
+        total_q_std += float(group_metrics["q_std"]) * float(group_count)
+        total_target_mean += float(group_metrics["target_mean"]) * float(group_count)
+        total_td_error_mean += float(group_metrics["td_error_mean"]) * float(group_count)
+        total_td_error_std += float(group_metrics["td_error_std"]) * float(group_count)
+        total_r_mean += float(group_metrics["reward_mean"]) * float(group_count)
 
         scaled_loss = group_loss * (float(group_count) / float(len(objective_counts)))
         weighted_loss = scaled_loss if weighted_loss is None else (weighted_loss + scaled_loss)
@@ -460,7 +485,17 @@ def compute_ddqn_loss(agent, target_agent, batch, cfg):
     if weighted_loss is None or total_count <= 0:
         raise ValueError("Failed to build objective-shape groups for DDQN loss.")
 
-    return weighted_loss, total_q_mean / total_count, total_r_mean / total_count
+    metrics = {
+        "q_mean": total_q_mean / total_count,
+        "q_std": total_q_std / total_count,
+        "target_mean": total_target_mean / total_count,
+        "td_error_mean": total_td_error_mean / total_count,
+        "td_error_std": total_td_error_std / total_count,
+        "reward_mean": total_r_mean / total_count,
+        "shape_group": len(group_sizes),
+        "group_sizes": group_sizes,
+    }
+    return weighted_loss, metrics
 
 
 def compute_env_reward(previous_archive_y, selected_y, ref_point, reward_scheme_id):
@@ -541,6 +576,7 @@ class DiscSAEAEnv:
         self.offspring_sigma = None
         self.ref_point = None
         self.nsga2_problem = None
+        self.init_hv = None
 
     def _progress(self):
         return float(self.t) / float(max(self.max_steps - 1, 1))
@@ -604,6 +640,7 @@ class DiscSAEAEnv:
             get_reference_point(self.problem_name, n_obj=int(self.archive_y.shape[1])),
             dtype=np.float32,
         )
+        self.init_hv = float(hypervolume(self.archive_y, self.ref_point))
         self.nsga2_problem = make_nsga2_problem_adapter(self.problem, int(self.archive_y.shape[1]))
         self._refresh_offspring()
         return self._build_state()
@@ -630,6 +667,9 @@ class DiscSAEAEnv:
         self._refresh_offspring()
         return self._build_state(), float(reward), bool(done)
 
+    def current_hv(self):
+        return float(hypervolume(np.asarray(self.archive_y, dtype=np.float32), self.ref_point))
+
 
 @ray.remote(num_cpus=1)
 class RolloutWorker:
@@ -639,7 +679,7 @@ class RolloutWorker:
         self.env_specs = list(env_specs)
 
     def rollout(self, state_dict_cpu, epsilon, episodes):
-        device = "cpu"
+        device = str(self.cfg.get("rollout_device", "cpu"))
 
         agent = Disc(
             hidden_dim=self.cfg["hidden_dim"],
@@ -655,10 +695,14 @@ class RolloutWorker:
 
         transitions = []
         ep_rewards = []
-        env_rewards = {}
+        env_stats = {}
         for env_idx, spec in enumerate(self.env_specs):
             key = env_key(spec["problem_name"], spec["dim"])
-            env_rewards[key] = []
+            env_stats[key] = {
+                "rewards": [],
+                "init_hv": [],
+                "final_hv": [],
+            }
 
             for ep in range(episodes):
                 env = DiscSAEAEnv(
@@ -669,6 +713,7 @@ class RolloutWorker:
                 )
                 state = env.reset()
                 total_reward = 0.0
+                init_hv = float(env.init_hv)
 
                 done = False
                 while not done:
@@ -713,9 +758,11 @@ class RolloutWorker:
                     state = next_state
 
                 ep_rewards.append(total_reward)
-                env_rewards[key].append(float(total_reward))
+                env_stats[key]["rewards"].append(float(total_reward))
+                env_stats[key]["init_hv"].append(init_hv)
+                env_stats[key]["final_hv"].append(float(env.current_hv()))
 
-        return transitions, ep_rewards, env_rewards
+        return transitions, ep_rewards, env_stats
 
 
 def save_training_checkpoint(agent, cfg, problem_name, epoch, mean_reward, best_reward):
@@ -761,6 +808,9 @@ def train_disc_ddqn_ray(
     training_set=1,
     num_workers=None,
     surrogate_nsga_steps=100,
+    device=None,
+    rollout_device="cpu",
+    surrogate_device="cpu",
 ):
     cfg = TrainConfig()
     cfg.reward_scheme = int(reward_scheme)
@@ -768,6 +818,10 @@ def train_disc_ddqn_ray(
     cfg.training_set = int(training_set)
     cfg.heldout_problem = str(problem_name).upper()
     cfg.surrogate_nsga_steps = int(surrogate_nsga_steps)
+    if device is not None:
+        cfg.device = str(device)
+    cfg.rollout_device = str(rollout_device)
+    cfg.surrogate_device = str(surrogate_device)
     if num_workers is not None:
         cfg.num_workers = int(num_workers)
     if cfg.surrogate_model not in {"gp", "kan", "tabpfn"}:
@@ -807,6 +861,25 @@ def train_disc_ddqn_ray(
         if len(worker_env_specs[i]) > 0
     ]
 
+    print(
+        "Training config | "
+        f"heldout={cfg.heldout_problem} | "
+        f"training_set={cfg.training_set} | "
+        f"envs={len(env_specs)} | "
+        f"workers={actual_num_workers} | "
+        f"reward_scheme={cfg.reward_scheme} | "
+        f"surrogate={cfg.surrogate_model} | "
+        f"sur_steps={cfg.surrogate_nsga_steps} | "
+        f"train_device={cfg.device} | "
+        f"rollout_device={cfg.rollout_device} | "
+        f"surrogate_device={cfg.surrogate_device} | "
+        f"lr={cfg.lr:.1e} | "
+        f"batch_size={cfg.batch_size} | "
+        f"replay_size={cfg.replay_size} | "
+        f"gamma={cfg.gamma:.4f} | "
+        f"target_update={cfg.target_update_interval}"
+    )
+
     for it in range(cfg.train_iters):
         epoch = int(it) + 1
         epsilon = epsilon_by_iter(it, cfg)
@@ -833,43 +906,81 @@ def train_disc_ddqn_ray(
         results = ray.get(futures)
 
         all_rewards = []
-        per_env_reward_lists = {}
-        for transitions, ep_rewards, env_rewards in results:
+        per_env_stats = {}
+        for transitions, ep_rewards, env_stats in results:
             replay.extend(transitions)
             all_rewards.extend(ep_rewards)
-            for key, values in env_rewards.items():
-                per_env_reward_lists.setdefault(key, []).extend(float(v) for v in values)
+            for key, stats in env_stats.items():
+                bucket = per_env_stats.setdefault(
+                    key,
+                    {
+                        "rewards": [],
+                        "init_hv": [],
+                        "final_hv": [],
+                    },
+                )
+                bucket["rewards"].extend(float(v) for v in stats["rewards"])
+                bucket["init_hv"].extend(float(v) for v in stats["init_hv"])
+                bucket["final_hv"].extend(float(v) for v in stats["final_hv"])
 
         mean_ep_reward = float(np.mean(all_rewards)) if all_rewards else 0.0
-        per_env_mean_rewards = {
-            key: float(np.mean(values))
-            for key, values in sorted(per_env_reward_lists.items())
-            if len(values) > 0
-        }
-        env_reward_log = " | ".join(
-            f"{key}={value:.4f}" for key, value in per_env_mean_rewards.items()
-        )
+        per_env_summaries = {}
+        for key, stats in sorted(per_env_stats.items()):
+            if len(stats["rewards"]) == 0:
+                continue
+            per_env_summaries[key] = {
+                "mean_reward": float(np.mean(stats["rewards"])),
+                "init_hv": float(np.mean(stats["init_hv"])),
+                "final_hv": float(np.mean(stats["final_hv"])),
+            }
 
         if len(replay) < cfg.batch_size:
+            empty_metrics = {
+                "q_mean": float("nan"),
+                "q_std": float("nan"),
+                "target_mean": float("nan"),
+                "td_error_mean": float("nan"),
+                "td_error_std": float("nan"),
+                "reward_mean": float("nan"),
+                "shape_group": 0,
+                "group_sizes": [],
+            }
             print(
                 f"[Epoch {epoch:04d}] "
                 f"set={cfg.training_set} | heldout={cfg.heldout_problem} | "
                 f"envs_active={len(env_specs)}/{len(env_specs)} | "
                 f"replay={len(replay)} | skip update | ep_return={mean_ep_reward:.4f}"
             )
-            if env_reward_log:
-                print(f"[Epoch {epoch:04d}] env_mean_reward | {env_reward_log}")
+            for key, stats in per_env_summaries.items():
+                print(
+                    f"{key} epoch {epoch} done, "
+                    f"mean reward = {stats['mean_reward']:.4f}, "
+                    f"init HV = {stats['init_hv']:.6f}, "
+                    f"final HV = {stats['final_hv']:.6f}"
+                )
+            print(
+                f"epoch {epoch} done | mean reward = {mean_ep_reward:.4f} | "
+                f"set = {cfg.training_set} | heldout = {cfg.heldout_problem} | "
+                f"surrogate = {cfg.surrogate_model} | sur_steps = {cfg.surrogate_nsga_steps} | "
+                f"workers = {actual_num_workers} | replay = {len(replay)} | update = skipped"
+                f" | td_loss = nan | grad_norm = nan | q_mean = {empty_metrics['q_mean']} | "
+                f"q_std = {empty_metrics['q_std']} | target_mean = {empty_metrics['target_mean']} | "
+                f"td_error_mean = {empty_metrics['td_error_mean']} | "
+                f"td_error_std = {empty_metrics['td_error_std']} | "
+                f"shape_group = {empty_metrics['shape_group']} | "
+                f"group_sizes = {empty_metrics['group_sizes']}"
+            )
             best_reward = save_training_checkpoint(agent, cfg, cfg.heldout_problem, epoch, mean_ep_reward, best_reward)
             continue
 
         batch = replay.sample(cfg.batch_size)
 
         agent.train()
-        loss, q_mean, r_mean = compute_ddqn_loss(agent, target_agent, batch, cfg)
+        loss, ddqn_metrics = compute_ddqn_loss(agent, target_agent, batch, cfg)
 
         optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(agent.parameters(), 1.0)
+        grad_norm = float(torch.nn.utils.clip_grad_norm_(agent.parameters(), 1.0))
         optimizer.step()
 
         if it % cfg.target_update_interval == 0:
@@ -884,13 +995,38 @@ def train_disc_ddqn_ray(
             f"sur_steps={cfg.surrogate_nsga_steps} | "
             f"eps={epsilon:.3f} | "
             f"replay={len(replay)} | "
-            f"loss={loss.item():.6f} | "
-            f"q_mean={q_mean:.4f} | "
-            f"batch_r={r_mean:.4f} | "
+            f"td_loss={loss.item():.6f} | "
+            f"grad_norm={grad_norm:.6f} | "
+            f"q_mean={ddqn_metrics['q_mean']:.4f} | "
+            f"q_std={ddqn_metrics['q_std']:.4f} | "
+            f"target_mean={ddqn_metrics['target_mean']:.4f} | "
+            f"td_error_mean={ddqn_metrics['td_error_mean']:.4f} | "
+            f"td_error_std={ddqn_metrics['td_error_std']:.4f} | "
+            f"shape_group={ddqn_metrics['shape_group']} | "
+            f"group_sizes={ddqn_metrics['group_sizes']} | "
+            f"batch_r={ddqn_metrics['reward_mean']:.4f} | "
             f"ep_return={mean_ep_reward:.4f}"
         )
-        if env_reward_log:
-            print(f"[Epoch {epoch:04d}] env_mean_reward | {env_reward_log}")
+        for key, stats in per_env_summaries.items():
+            print(
+                f"epoch {epoch} -> {key} epoch {epoch} done, "
+                f"mean reward = {stats['mean_reward']:.4f}, "
+                f"init HV = {stats['init_hv']:.6f}, "
+                f"final HV = {stats['final_hv']:.6f}"
+            )
+        print(
+            f"epoch {epoch} done | mean reward = {mean_ep_reward:.4f} | "
+            f"set = {cfg.training_set} | heldout = {cfg.heldout_problem} | "
+            f"surrogate = {cfg.surrogate_model} | sur_steps = {cfg.surrogate_nsga_steps} | "
+            f"workers = {actual_num_workers} | replay = {len(replay)} | "
+            f"td_loss = {loss.item():.6f} | grad_norm = {grad_norm:.6f} | "
+            f"q_mean = {ddqn_metrics['q_mean']:.4f} | q_std = {ddqn_metrics['q_std']:.4f} | "
+            f"target_mean = {ddqn_metrics['target_mean']:.4f} | "
+            f"td_error_mean = {ddqn_metrics['td_error_mean']:.4f} | "
+            f"td_error_std = {ddqn_metrics['td_error_std']:.4f} | "
+            f"shape_group = {ddqn_metrics['shape_group']} | "
+            f"group_sizes = {ddqn_metrics['group_sizes']}"
+        )
 
         best_reward = save_training_checkpoint(agent, cfg, cfg.heldout_problem, epoch, mean_ep_reward, best_reward)
 
@@ -907,4 +1043,7 @@ if __name__ == "__main__":
         training_set=int(args.training_set),
         num_workers=args.num_workers,
         surrogate_nsga_steps=int(args.surrogate_nsga_steps),
+        device=args.device,
+        rollout_device=str(args.rollout_device),
+        surrogate_device=str(args.surrogate_device),
     )
