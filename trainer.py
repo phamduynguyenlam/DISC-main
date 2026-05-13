@@ -2,6 +2,7 @@ import os
 import argparse
 import copy
 import random
+import time
 from datetime import datetime
 from dataclasses import dataclass
 from collections import deque
@@ -975,6 +976,7 @@ def train_disc_ddqn_ray(
             results = ray_mod.get(futures)
         else:
             results = [f.result() for f in futures]
+        update_start_time = time.perf_counter()
 
         per_env_stats = {}
         for result in results:
@@ -1039,8 +1041,9 @@ def train_disc_ddqn_ray(
                 f"epoch {epoch} done | mean reward/FE = {mean_ep_reward:.4f} | "
                 f"set = {cfg.training_set} | heldout = {cfg.heldout_problem} | "
             f"surrogate = {cfg.surrogate_model} | sur_steps = {cfg.surrogate_nsga_steps} | "
-            f"workers = {actual_num_workers} | replay = {len(replay)} | "
-            f"reward_scheme = {cfg.reward_scheme} | policy = {cfg.policy_mode} | update = skipped"
+                f"workers = {actual_num_workers} | replay = {len(replay)} | "
+                f"reward_scheme = {cfg.reward_scheme} | policy = {cfg.policy_mode} | update = skipped"
+                f" | update_time_sec = {time.perf_counter() - update_start_time:.3f}"
                 f" | td_loss = nan | grad_norm = nan | q_mean = {empty_metrics['q_mean']} | "
                 f"q_std = {empty_metrics['q_std']} | target_mean = {empty_metrics['target_mean']} | "
                 f"td_error_mean = {empty_metrics['td_error_mean']} | "
@@ -1087,6 +1090,7 @@ def train_disc_ddqn_ray(
 
         if it % cfg.target_update_interval == 0:
             target_agent.load_state_dict(agent.state_dict())
+        update_elapsed = time.perf_counter() - update_start_time
 
         mean_update_metrics = {}
         for key in ["td_loss", "grad_norm", "q_mean", "q_std", "target_mean", "td_error_mean", "td_error_std", "reward_mean"]:
@@ -1112,6 +1116,7 @@ def train_disc_ddqn_ray(
             f"surrogate={cfg.surrogate_model} | "
             f"sur_steps={cfg.surrogate_nsga_steps} | "
             f"updates={cfg.updates_per_epoch} | "
+            f"update_time_sec={update_elapsed:.3f} | "
             f"eps={epsilon:.3f} | "
             f"replay={len(replay)} | "
             f"td_loss={mean_update_metrics['td_loss']:.6f} | "
@@ -1133,6 +1138,7 @@ def train_disc_ddqn_ray(
             f"workers = {actual_num_workers} | replay = {len(replay)} | "
             f"reward_scheme = {cfg.reward_scheme} | policy = {cfg.policy_mode} | "
             f"updates = {len(update_metrics_list)} | "
+            f"update_time_sec = {update_elapsed:.3f} | "
             f"td_loss = {mean_update_metrics['td_loss']:.6f} | grad_norm = {mean_update_metrics['grad_norm']:.6f} | "
             f"q_mean = {mean_update_metrics['q_mean']:.4f} | q_std = {mean_update_metrics['q_std']:.4f} | "
             f"target_mean = {mean_update_metrics['target_mean']:.4f} | "

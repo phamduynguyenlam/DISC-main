@@ -496,7 +496,10 @@ def main() -> None:
         history.append(record)
         step_rewards.append(step_reward)
 
-        print(f"iter {record.step} | front = {front_size} | HV = {record.hv:.6f}")
+        print(
+            f"iter {record.step} | front = {front_size} | "
+            f"HV = {record.hv:.6f} | reward = {record.reward:.6f}"
+        )
         # Refit surrogate after admitting one new true-evaluated sample.
         surrogate = build_surrogate(args, archive_x, archive_y)
 
