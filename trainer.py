@@ -771,20 +771,29 @@ def rollout_episode_task_local(state_dict_cpu, cfg_dict, problem_name, dim, seed
     )
 
 
-def save_training_checkpoint(agent, cfg, problem_name, epoch, mean_reward, best_reward):
+def save_training_checkpoint(
+    agent,
+    cfg,
+    problem_name,
+    epoch,
+    mean_reward,
+    best_reward,
+    best_state_dict=None,
+):
     os.makedirs(cfg.weight_dir, exist_ok=True)
     rs_tag = f"rs{int(cfg.reward_scheme)}"
     problem_tag = str(problem_name).lower()
 
     if mean_reward > best_reward:
         best_path = os.path.join(cfg.weight_dir, f"disc_problem_{problem_tag}_{rs_tag}_best_reward.pth")
+        state_dict_to_save = best_state_dict if best_state_dict is not None else agent.state_dict()
         torch.save(
             {
                 "epoch": int(epoch),
                 "problem_name": str(problem_name),
                 "reward_scheme": int(cfg.reward_scheme),
                 "mean_reward": float(mean_reward),
-                "state_dict": agent.state_dict(),
+                "state_dict": state_dict_to_save,
             },
             best_path,
         )
@@ -924,6 +933,7 @@ def train_disc_ddqn_ray(
         )
 
         state_cpu = clone_state_dict_cpu(agent)
+        pre_update_state_dict = copy.deepcopy(agent.state_dict())
         futures = []
         for env_idx, spec in enumerate(env_specs):
             for ep in range(int(cfg.episodes_per_worker)):
@@ -1030,7 +1040,15 @@ def train_disc_ddqn_ray(
                 f"shape_group = {empty_metrics['shape_group']} | "
                 f"group_sizes = {empty_metrics['shape_group_summary']}"
             )
-            best_reward = save_training_checkpoint(agent, cfg, cfg.heldout_problem, epoch, mean_ep_reward, best_reward)
+            best_reward = save_training_checkpoint(
+                agent,
+                cfg,
+                cfg.heldout_problem,
+                epoch,
+                mean_ep_reward,
+                best_reward,
+                best_state_dict=pre_update_state_dict,
+            )
             continue
 
         update_metrics_list = []
@@ -1116,7 +1134,15 @@ def train_disc_ddqn_ray(
             f"group_sizes = {mean_update_metrics['shape_group_summary']}"
         )
 
-        best_reward = save_training_checkpoint(agent, cfg, cfg.heldout_problem, epoch, mean_ep_reward, best_reward)
+        best_reward = save_training_checkpoint(
+            agent,
+            cfg,
+            cfg.heldout_problem,
+            epoch,
+            mean_ep_reward,
+            best_reward,
+            best_state_dict=pre_update_state_dict,
+        )
 
     if executor is not None:
         executor.shutdown(wait=True)
