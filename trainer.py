@@ -45,7 +45,7 @@ class TrainConfig:
     lr: float = 1e-4
     target_update_interval: int = 20
     train_iters: int = 50
-    updates_per_epoch: int = 80
+    updates_per_epoch: int = 1
     epsilon_start: float = 0.3
     epsilon_end: float = 0.05
     epsilon_decay_iters: int = 1000
@@ -115,7 +115,7 @@ def parse_args():
     parser.add_argument("--training_set", type=int, default=1, choices=[1, 2, 3])
     parser.add_argument("--num_workers", type=int, default=None)
     parser.add_argument("--surrogate_nsga_steps", type=int, default=100)
-    parser.add_argument("--updates_per_epoch", type=int, default=1)
+    parser.add_argument("--updates_per_epoch", type=int, default=None)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--rollout_device", type=str, default="cpu")
     parser.add_argument("--surrogate_device", type=str, default="cpu")
@@ -814,7 +814,7 @@ def train_disc_ddqn_ray(
     training_set=1,
     num_workers=None,
     surrogate_nsga_steps=100,
-    updates_per_epoch=80,
+    updates_per_epoch=None,
     device=None,
     rollout_device="cpu",
     surrogate_device="cpu",
@@ -826,7 +826,8 @@ def train_disc_ddqn_ray(
     cfg.training_set = int(training_set)
     cfg.heldout_problem = str(problem_name).upper()
     cfg.surrogate_nsga_steps = int(surrogate_nsga_steps)
-    cfg.updates_per_epoch = int(updates_per_epoch)
+    if updates_per_epoch is not None:
+        cfg.updates_per_epoch = int(updates_per_epoch)
     if device is not None:
         cfg.device = str(device)
     cfg.rollout_device = str(rollout_device)
