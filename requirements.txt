@@ -8,5 +8,5 @@ gpytorch>=1.13,<2
 scikit-learn>=1.4,<2
 pymoo>=0.6.1,<0.7
 torch>=2.2,<3
+ray>=2.9,<3
 tabpfn>=2,<3    
-

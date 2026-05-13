@@ -16,8 +16,6 @@ from surrogate.kan import KAN
 
 os.environ["TABPFN_TOKEN"] = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyIjoiMWYwZGEyZWEtOGY1Zi00MGNiLWJlNzUtN2U1OTI2YTAxZGFlIiwiZXhwIjoxODA5MDE1MjA3fQ.rFxK90AswdPigPC-vBVUmAELAiVtOvy5YNGfTDUam8A"
 
-from tabpfn import TabPFNClassifier
-
 def _hydrate_tabpfn_env_from_windows_user_env() -> None:
     if sys.platform != "win32":
         return

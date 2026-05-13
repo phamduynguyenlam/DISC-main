@@ -2,6 +2,7 @@ import os
 import argparse
 import copy
 import random
+from datetime import datetime
 from dataclasses import dataclass
 from collections import deque
 
@@ -823,6 +824,17 @@ def train_disc_ddqn_ray(
         raise ValueError(f"num_workers must be positive, got {cfg.num_workers}.")
     actual_num_workers = min(int(cfg.num_workers), len(env_specs))
     cfg_dict = cfg.__dict__.copy()
+    os.makedirs("training_logs", exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = os.path.join(
+        "training_logs",
+        f"trainer_{cfg.heldout_problem.lower()}_set{cfg.training_set}_{ts}.txt",
+    )
+    log_fp = open(log_path, "a", encoding="utf-8", buffering=1)
+
+    def log(msg):
+        print(msg)
+        log_fp.write(str(msg) + "\n")
 
     if not ray.is_initialized():
         ray.init(num_cpus=actual_num_workers, ignore_reinit_error=True)
@@ -842,7 +854,7 @@ def train_disc_ddqn_ray(
     optimizer = optim.Adam(agent.parameters(), lr=cfg.lr)
     best_reward = -float("inf")
 
-    print(
+    log(
         "Training config | "
         f"heldout={cfg.heldout_problem} | "
         f"training_set={cfg.training_set} | "
@@ -860,7 +872,8 @@ def train_disc_ddqn_ray(
         f"batch_size={cfg.batch_size} | "
         f"replay_size={cfg.replay_size} | "
         f"gamma={cfg.gamma:.4f} | "
-        f"target_update={cfg.target_update_interval}"
+        f"target_update={cfg.target_update_interval} | "
+        f"log_path={log_path}"
     )
 
     for it in range(cfg.train_iters):
@@ -868,7 +881,7 @@ def train_disc_ddqn_ray(
         epsilon = epsilon_by_iter(it, cfg)
         replay = ReplayBuffer(cfg.replay_size)
 
-        print(
+        log(
             f"[Epoch {epoch:04d}] start | "
             f"set={cfg.training_set} | "
             f"heldout={cfg.heldout_problem} | "
@@ -936,20 +949,20 @@ def train_disc_ddqn_ray(
                 "shape_group": 0,
                 "group_sizes": [],
             }
-            print(
+            log(
                 f"[Epoch {epoch:04d}] "
                 f"set={cfg.training_set} | heldout={cfg.heldout_problem} | "
                 f"envs_active={len(env_specs)}/{len(env_specs)} | "
                 f"replay={len(replay)} | skip update | ep_return={mean_ep_reward:.4f}"
             )
             for key, stats in per_env_summaries.items():
-                print(
+                log(
                     f"{key} epoch {epoch} done, "
                     f"mean reward = {stats['mean_reward']:.4f}, "
                     f"init HV = {stats['init_hv']:.6f}, "
                     f"final HV = {stats['final_hv']:.6f}"
                 )
-            print(
+            log(
                 f"epoch {epoch} done | mean reward = {mean_ep_reward:.4f} | "
                 f"set = {cfg.training_set} | heldout = {cfg.heldout_problem} | "
             f"surrogate = {cfg.surrogate_model} | sur_steps = {cfg.surrogate_nsga_steps} | "
@@ -999,7 +1012,7 @@ def train_disc_ddqn_ray(
         mean_update_metrics["shape_group"] = int(round(np.mean([m["shape_group"] for m in update_metrics_list])))
         mean_update_metrics["group_sizes"] = [m["group_sizes"] for m in update_metrics_list]
 
-        print(
+        log(
             f"[Epoch {epoch:04d}] "
             f"set={cfg.training_set} | "
             f"heldout={cfg.heldout_problem} | "
@@ -1022,13 +1035,13 @@ def train_disc_ddqn_ray(
             f"ep_return={mean_ep_reward:.4f}"
         )
         for key, stats in per_env_summaries.items():
-            print(
+            log(
                 f"epoch {epoch} -> {key} epoch {epoch} done, "
                 f"mean reward = {stats['mean_reward']:.4f}, "
                 f"init HV = {stats['init_hv']:.6f}, "
                 f"final HV = {stats['final_hv']:.6f}"
             )
-        print(
+        log(
             f"epoch {epoch} done | mean reward = {mean_ep_reward:.4f} | "
             f"set = {cfg.training_set} | heldout = {cfg.heldout_problem} | "
             f"surrogate = {cfg.surrogate_model} | sur_steps = {cfg.surrogate_nsga_steps} | "
@@ -1046,6 +1059,7 @@ def train_disc_ddqn_ray(
 
         best_reward = save_training_checkpoint(agent, cfg, cfg.heldout_problem, epoch, mean_ep_reward, best_reward)
 
+    log_fp.close()
     return agent
 
 
