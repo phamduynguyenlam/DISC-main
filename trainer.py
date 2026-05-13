@@ -45,7 +45,7 @@ class TrainConfig:
     lr: float = 1e-4
     target_update_interval: int = 20
     train_iters: int = 50
-    updates_per_epoch: int = 1
+    updates_per_epoch: int = 80
     epsilon_start: float = 0.3
     epsilon_end: float = 0.05
     epsilon_decay_iters: int = 1000
