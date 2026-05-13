@@ -442,6 +442,7 @@ def compute_ddqn_loss(agent, target_agent, batch, cfg):
     total_r_mean = 0.0
     weighted_loss = None
     group_sizes = []
+    group_objectives = []
 
     batch_items = [
         x_true,
@@ -463,7 +464,7 @@ def compute_ddqn_loss(agent, target_agent, batch, cfg):
         dones,
     ]
 
-    for indices in groups.values():
+    for n_obj, indices in groups.items():
         subbatch = []
         for item in batch_items:
             subbatch.append([item[i] for i in indices])
@@ -477,6 +478,7 @@ def compute_ddqn_loss(agent, target_agent, batch, cfg):
 
         total_count += int(group_count)
         group_sizes.append(int(group_count))
+        group_objectives.append(int(n_obj))
         total_q_mean += float(group_metrics["q_mean"]) * float(group_count)
         total_q_std += float(group_metrics["q_std"]) * float(group_count)
         total_target_mean += float(group_metrics["target_mean"]) * float(group_count)
@@ -499,6 +501,10 @@ def compute_ddqn_loss(agent, target_agent, batch, cfg):
         "reward_mean": total_r_mean / total_count,
         "shape_group": len(group_sizes),
         "group_sizes": group_sizes,
+        "group_objectives": group_objectives,
+        "shape_group_detail": {
+            int(n_obj): int(sz) for n_obj, sz in zip(group_objectives, group_sizes)
+        },
     }
     return weighted_loss, metrics
 
@@ -747,6 +753,7 @@ def _rollout_episode_impl(state_dict_cpu, cfg_dict, problem_name, dim, seed, eps
     return {
         "transitions": transitions,
         "episode_reward": float(total_reward),
+        "episode_steps": int(len(transitions)),
         "env_key": env_key(problem_name, dim),
         "init_hv": init_hv,
         "final_hv": float(env.current_hv()),
@@ -807,7 +814,7 @@ def train_disc_ddqn_ray(
     training_set=1,
     num_workers=None,
     surrogate_nsga_steps=100,
-    updates_per_epoch=1,
+    updates_per_epoch=80,
     device=None,
     rollout_device="cpu",
     surrogate_device="cpu",
@@ -950,37 +957,43 @@ def train_disc_ddqn_ray(
         else:
             results = [f.result() for f in futures]
 
-        all_rewards = []
         per_env_stats = {}
         for result in results:
             replay.extend(result["transitions"])
-            all_rewards.append(float(result["episode_reward"]))
             bucket = per_env_stats.setdefault(
                 result["env_key"],
                 {
                     "rewards": [],
+                    "reward_per_fe": [],
                     "init_hv": [],
                     "final_hv": [],
                 },
             )
-            bucket["rewards"].append(float(result["episode_reward"]))
+            ep_reward = float(result["episode_reward"])
+            ep_steps = max(int(result.get("episode_steps", 0)), 1)
+            bucket["rewards"].append(ep_reward)
+            bucket["reward_per_fe"].append(ep_reward / float(ep_steps))
             bucket["init_hv"].append(float(result["init_hv"]))
             bucket["final_hv"].append(float(result["final_hv"]))
-
-        mean_ep_reward = float(np.mean(all_rewards)) if all_rewards else 0.0
         per_env_summaries = {}
         for key, stats in sorted(per_env_stats.items()):
             if len(stats["rewards"]) == 0:
                 continue
             per_env_summaries[key] = {
                 "mean_reward": float(np.mean(stats["rewards"])),
+                "mean_reward_per_fe": float(np.mean(stats["reward_per_fe"])),
                 "init_hv": float(np.mean(stats["init_hv"])),
                 "final_hv": float(np.mean(stats["final_hv"])),
             }
+        mean_ep_reward = (
+            float(np.mean([v["mean_reward_per_fe"] for v in per_env_summaries.values()]))
+            if per_env_summaries
+            else 0.0
+        )
         for key, stats in per_env_summaries.items():
             log(
                 f"{key} epoch {epoch} done, "
-                f"mean reward = {stats['mean_reward']:.4f}, "
+                f"mean reward/FE = {stats['mean_reward_per_fe']:.4f}, "
                 f"init HV = {stats['init_hv']:.6f}, "
                 f"final HV = {stats['final_hv']:.6f}"
             )
@@ -1000,10 +1013,10 @@ def train_disc_ddqn_ray(
                 f"[Epoch {epoch:04d}] "
                 f"set={cfg.training_set} | heldout={cfg.heldout_problem} | "
                 f"envs_active={len(env_specs)}/{len(env_specs)} | "
-                f"replay={len(replay)} | skip update | ep_return={mean_ep_reward:.4f}"
+                f"replay={len(replay)} | skip update | ep_return_per_fe={mean_ep_reward:.4f}"
             )
             log(
-                f"epoch {epoch} done | mean reward = {mean_ep_reward:.4f} | "
+                f"epoch {epoch} done | mean reward/FE = {mean_ep_reward:.4f} | "
                 f"set = {cfg.training_set} | heldout = {cfg.heldout_problem} | "
             f"surrogate = {cfg.surrogate_model} | sur_steps = {cfg.surrogate_nsga_steps} | "
             f"workers = {actual_num_workers} | replay = {len(replay)} | "
@@ -1072,10 +1085,10 @@ def train_disc_ddqn_ray(
             f"shape_group={mean_update_metrics['shape_group']} | "
             f"group_sizes={mean_update_metrics['group_sizes']} | "
             f"batch_r={mean_update_metrics['reward_mean']:.4f} | "
-            f"ep_return={mean_ep_reward:.4f}"
+            f"ep_return_per_fe={mean_ep_reward:.4f}"
         )
         log(
-            f"epoch {epoch} done | mean reward = {mean_ep_reward:.4f} | "
+            f"epoch {epoch} done | mean reward/FE = {mean_ep_reward:.4f} | "
             f"set = {cfg.training_set} | heldout = {cfg.heldout_problem} | "
             f"surrogate = {cfg.surrogate_model} | sur_steps = {cfg.surrogate_nsga_steps} | "
             f"workers = {actual_num_workers} | replay = {len(replay)} | "
