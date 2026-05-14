@@ -49,7 +49,7 @@ class TrainConfig:
     updates_per_epoch: int = 80
     epsilon_start: float = 0.3
     epsilon_end: float = 0.05
-    epsilon_decay_iters: int = 1000
+    epsilon_decay_iters: int = 10
     hidden_dim: int = 128
     n_heads: int = 8
     ff_dim: int = 256
@@ -111,6 +111,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train DISC with surrogate-assisted environments.")
     parser.add_argument("--problem", type=str, default="ZDT1")
     parser.add_argument("--dim", type=int, default=30)
+    parser.add_argument("--epoch", type=int, default=None)
     parser.add_argument("--reward_scheme", type=int, default=1, choices=[1, 2, 3])
     parser.add_argument("--surrogate_model", type=str, default="kan", choices=["gp", "kan", "tabpfn"])
     parser.add_argument("--training_set", type=int, default=1, choices=[1, 2, 3])
@@ -827,6 +828,7 @@ def save_training_checkpoint(
 def train_disc_ddqn_ray(
     problem_name="ZDT1",
     dim=30,
+    epoch=None,
     reward_scheme=1,
     surrogate_model="kan",
     training_set=1,
@@ -839,6 +841,8 @@ def train_disc_ddqn_ray(
     use_ray=False,
 ):
     cfg = TrainConfig()
+    if epoch is not None:
+        cfg.train_iters = int(epoch)
     cfg.reward_scheme = int(reward_scheme)
     cfg.surrogate_model = str(surrogate_model).lower()
     cfg.training_set = int(training_set)
@@ -860,6 +864,8 @@ def train_disc_ddqn_ray(
     env_specs = build_training_env_specs(cfg.heldout_problem, cfg.training_set)
     if int(cfg.num_workers) <= 0:
         raise ValueError(f"num_workers must be positive, got {cfg.num_workers}.")
+    if int(cfg.train_iters) <= 0:
+        raise ValueError(f"epoch must be positive, got {cfg.train_iters}.")
     actual_num_workers = min(int(cfg.num_workers), len(env_specs))
     cfg_dict = cfg.__dict__.copy()
     os.makedirs("training_logs", exist_ok=True)
@@ -913,6 +919,7 @@ def train_disc_ddqn_ray(
         f"policy={cfg.policy_mode} | "
         f"surrogate={cfg.surrogate_model} | "
         f"sampling_backend={'ray' if use_ray else 'process_pool'} | "
+        f"epochs={cfg.train_iters} | "
         f"sur_steps={cfg.surrogate_nsga_steps} | "
         f"updates_per_epoch={cfg.updates_per_epoch} | "
         f"train_device={cfg.device} | "
@@ -1051,6 +1058,8 @@ def train_disc_ddqn_ray(
                 f"shape_group = {empty_metrics['shape_group']} | "
                 f"group_sizes = {empty_metrics['shape_group_summary']}"
             )
+            if mean_ep_reward > best_reward:
+                log(f"new best mean reward at epoch {epoch}: {mean_ep_reward:.4f}")
             best_reward = save_training_checkpoint(
                 agent,
                 cfg,
@@ -1148,6 +1157,8 @@ def train_disc_ddqn_ray(
             f"group_sizes = {mean_update_metrics['shape_group_summary']}"
         )
 
+        if mean_ep_reward > best_reward:
+            log(f"new best mean reward at epoch {epoch}: {mean_ep_reward:.4f}")
         best_reward = save_training_checkpoint(
             agent,
             cfg,
@@ -1171,6 +1182,7 @@ if __name__ == "__main__":
     train_disc_ddqn_ray(
         problem_name=args.problem,
         dim=int(args.dim),
+        epoch=args.epoch,
         reward_scheme=int(args.reward_scheme),
         surrogate_model=str(args.surrogate_model),
         training_set=int(args.training_set),
