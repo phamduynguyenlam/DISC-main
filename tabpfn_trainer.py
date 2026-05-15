@@ -127,9 +127,9 @@ class TabPFNBatchCoordinator:
                 x_batch = np.concatenate(x_parts, axis=0).astype(np.float32)
                 try:
                     if mode == "mean":
-                        pred_batch = np.asarray(backend.predict_mean(x_batch), dtype=np.float32)
+                        pred_batch = _tabpfn_predict_mean_backend(backend, x_batch)
                     elif mode == "std":
-                        pred_batch = np.asarray(backend.predict_std(x_batch), dtype=np.float32)
+                        pred_batch = _tabpfn_predict_std_backend(backend, x_batch)
                     else:
                         raise ValueError(f"Unsupported TabPFN batch mode: {mode}")
                 except BaseException as exc:
@@ -143,6 +143,28 @@ class TabPFNBatchCoordinator:
                     hi = int(offsets[req_idx + 1])
                     req.result = np.asarray(pred_batch[lo:hi], dtype=np.float32)
                     req.done.set()
+
+
+def _tabpfn_predict_mean_backend(backend: Any, x: np.ndarray) -> np.ndarray:
+    x_arr = np.asarray(x, dtype=np.float32)
+    if hasattr(backend, "predict_mean"):
+        return np.asarray(backend.predict_mean(x_arr), dtype=np.float32)
+    if hasattr(backend, "predict"):
+        return np.asarray(backend.predict(x_arr), dtype=np.float32)
+    if hasattr(backend, "predict_mean_std"):
+        mean, _ = backend.predict_mean_std(x_arr)
+        return np.asarray(mean, dtype=np.float32)
+    raise AttributeError(f"{type(backend).__name__} does not implement predict_mean(), predict(), or predict_mean_std().")
+
+
+def _tabpfn_predict_std_backend(backend: Any, x: np.ndarray) -> np.ndarray:
+    x_arr = np.asarray(x, dtype=np.float32)
+    if hasattr(backend, "predict_std"):
+        return np.asarray(backend.predict_std(x_arr), dtype=np.float32)
+    if hasattr(backend, "predict_mean_std"):
+        _, std = backend.predict_mean_std(x_arr)
+        return np.asarray(std, dtype=np.float32)
+    raise AttributeError(f"{type(backend).__name__} does not implement predict_std() or predict_mean_std().")
 
 
 class BatchedTabPFNSurrogate:
