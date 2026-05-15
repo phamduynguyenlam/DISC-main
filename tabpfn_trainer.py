@@ -76,6 +76,7 @@ class TabPFNBatchCoordinator:
         self._pending: list[_TabPFNBatchRequest] = []
         self._closed = False
         self._cv = threading.Condition()
+        self._batch_counter = 0
         self._worker = threading.Thread(target=self._serve, name="tabpfn-batch-worker", daemon=True)
         self._worker.start()
 
@@ -125,6 +126,8 @@ class TabPFNBatchCoordinator:
                 x_parts = [np.asarray(req.x, dtype=np.float32) for req in requests]
                 offsets = np.cumsum([0] + [int(part.shape[0]) for part in x_parts])
                 x_batch = np.concatenate(x_parts, axis=0).astype(np.float32)
+                batch_id = self._batch_counter + 1
+                eval_start_time = time.perf_counter()
                 try:
                     if mode == "mean":
                         pred_batch = _tabpfn_predict_mean_backend(backend, x_batch)
@@ -137,6 +140,16 @@ class TabPFNBatchCoordinator:
                         req.error = exc
                         req.done.set()
                     continue
+                eval_elapsed = time.perf_counter() - eval_start_time
+                self._batch_counter = batch_id
+                print(
+                    f"[TabPFN batch {batch_id:05d}] "
+                    f"mode={mode} | "
+                    f"requests={len(requests)} | "
+                    f"points={int(x_batch.shape[0])} | "
+                    f"dim={int(x_batch.shape[1]) if x_batch.ndim == 2 else 0} | "
+                    f"time_sec={eval_elapsed:.3f}"
+                )
 
                 for req_idx, req in enumerate(requests):
                     lo = int(offsets[req_idx])
@@ -423,6 +436,7 @@ def train_disc_ddqn_tabpfn(
             state_cpu = clone_state_dict_cpu(agent)
             pre_update_state_dict = copy.deepcopy(agent.state_dict())
             futures = []
+            interact_start_time = time.perf_counter()
             for env_idx, spec in enumerate(env_specs):
                 for ep in range(int(cfg.episodes_per_worker)):
                     seed = 100000 * epoch_id + 1000 * env_idx + ep
@@ -469,6 +483,14 @@ def train_disc_ddqn_tabpfn(
                 results = ray_mod.get(futures)
             else:
                 results = [f.result() for f in futures]
+            interact_elapsed = time.perf_counter() - interact_start_time
+
+            log(
+                f"[Epoch {epoch_id:04d}] interact done | "
+                f"workers={actual_num_workers} | "
+                f"episodes={len(futures)} | "
+                f"interact_time_sec={interact_elapsed:.3f}"
+            )
 
             per_env_stats = {}
             for result in results:
@@ -528,7 +550,8 @@ def train_disc_ddqn_tabpfn(
                     f"[Epoch {epoch_id:04d}] "
                     f"set={cfg.training_set} | heldout={cfg.heldout_problem} | "
                     f"envs_active={len(env_specs)}/{len(env_specs)} | "
-                    f"replay={len(replay)} | skip update | ep_return_per_fe={mean_ep_reward:.4f}"
+                    f"replay={len(replay)} | interact_time_sec={interact_elapsed:.3f} | "
+                    f"skip update | ep_return_per_fe={mean_ep_reward:.4f}"
                 )
                 log(
                     f"epoch {epoch_id} done | mean reward/FE = {mean_ep_reward:.4f} | "
@@ -536,6 +559,7 @@ def train_disc_ddqn_tabpfn(
                     f"surrogate = {cfg.surrogate_model} | sur_steps = {cfg.surrogate_nsga_steps} | "
                     f"workers = {actual_num_workers} | replay = {len(replay)} | "
                     f"reward_scheme = {cfg.reward_scheme} | policy = {cfg.policy_mode} | update = skipped"
+                    f" | interact_time_sec = {interact_elapsed:.3f}"
                     f" | update_time_sec = {time.perf_counter() - update_start_time:.3f}"
                     f" | td_loss = nan | grad_norm = nan | q_mean = {empty_metrics['q_mean']} | "
                     f"q_std = {empty_metrics['q_std']} | target_mean = {empty_metrics['target_mean']} | "
@@ -610,6 +634,7 @@ def train_disc_ddqn_tabpfn(
                 f"envs_active={len(env_specs)}/{len(env_specs)} | "
                 f"surrogate={cfg.surrogate_model} | "
                 f"sur_steps={cfg.surrogate_nsga_steps} | "
+                f"interact_time_sec={interact_elapsed:.3f} | "
                 f"updates={cfg.updates_per_epoch} | "
                 f"update_time_sec={update_elapsed:.3f} | "
                 f"eps={epsilon:.3f} | "
@@ -632,6 +657,7 @@ def train_disc_ddqn_tabpfn(
                 f"surrogate = {cfg.surrogate_model} | sur_steps = {cfg.surrogate_nsga_steps} | "
                 f"workers = {actual_num_workers} | replay = {len(replay)} | "
                 f"reward_scheme = {cfg.reward_scheme} | policy = {cfg.policy_mode} | "
+                f"interact_time_sec = {interact_elapsed:.3f} | "
                 f"updates = {len(update_metrics_list)} | "
                 f"update_time_sec = {update_elapsed:.3f} | "
                 f"td_loss = {mean_update_metrics['td_loss']:.6f} | grad_norm = {mean_update_metrics['grad_norm']:.6f} | "
