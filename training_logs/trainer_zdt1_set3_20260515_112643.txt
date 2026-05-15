@@ -1,0 +1,5 @@
+Training config | heldout=ZDT1 | training_set=3 | envs=3 | workers=3 | reward_scheme=1 | policy=epsilon_greedy | surrogate=gp | sampling_backend=process_pool | epochs=50 | sur_steps=5 | updates_per_epoch=1 | train_device=cuda | rollout_device=cpu | surrogate_device=cpu | lr=1.0e-04 | batch_size=64 | replay_size=50000 | gamma=1.0000 | target_update=20 | log_path=training_logs\trainer_zdt1_set3_20260515_112643.txt
+[Epoch 0001] start | set=3 | heldout=ZDT1 | envs_active=3/3 | surrogate=gp | sur_steps=5 | eps=0.300
+ZDT1-15D epoch 1 done, mean reward/FE = -0.7251, init HV = 3.155852, final HV = 3.192650
+ZDT1-20D epoch 1 done, mean reward/FE = -0.7959, init HV = 3.000952, final HV = 3.005082
+ZDT1-25D epoch 1 done, mean reward/FE = -0.8989, init HV = 2.725980, final HV = 2.726785
