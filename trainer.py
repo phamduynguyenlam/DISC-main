@@ -110,6 +110,7 @@ def parse_args():
     parser.add_argument("--problem", type=str, default="ZDT1")
     parser.add_argument("--dim", type=int, default=30)
     parser.add_argument("--epoch", type=int, default=None)
+    parser.add_argument("--gamma", type=float, default=None)
     parser.add_argument("--reward_scheme", type=int, default=1, choices=[1, 2, 3])
     parser.add_argument("--surrogate_model", type=str, default="kan", choices=["gp", "kan", "tabpfn"])
     parser.add_argument("--training_set", type=int, default=1, choices=[1, 2, 3])
@@ -816,6 +817,7 @@ def train_disc_ddqn_ray(
     problem_name="ZDT1",
     dim=30,
     epoch=None,
+    gamma=None,
     reward_scheme=1,
     surrogate_model="kan",
     training_set=1,
@@ -830,6 +832,8 @@ def train_disc_ddqn_ray(
     cfg = TrainConfig()
     if epoch is not None:
         cfg.train_iters = int(epoch)
+    if gamma is not None:
+        cfg.gamma = float(gamma)
     cfg.reward_scheme = int(reward_scheme)
     cfg.surrogate_model = str(surrogate_model).lower()
     cfg.training_set = int(training_set)
@@ -1170,6 +1174,7 @@ if __name__ == "__main__":
         problem_name=args.problem,
         dim=int(args.dim),
         epoch=args.epoch,
+        gamma=args.gamma,
         reward_scheme=int(args.reward_scheme),
         surrogate_model=str(args.surrogate_model),
         training_set=int(args.training_set),
