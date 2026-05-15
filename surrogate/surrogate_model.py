@@ -9,8 +9,6 @@ from typing import Any, Sequence
 
 import numpy as np
 import torch
-from sklearn.gaussian_process import GaussianProcessRegressor
-from sklearn.gaussian_process.kernels import ConstantKernel, RBF, WhiteKernel
 
 from surrogate.kan import KAN
 
@@ -64,17 +62,6 @@ class SurrogateModel(ABC):
 
     def predict_std(self, x: np.ndarray) -> np.ndarray:
         raise NotImplementedError
-
-
-@dataclass
-class GPSurrogateModel(SurrogateModel):
-    models: list[GaussianProcessRegressor]
-
-    def predict_mean(self, x: np.ndarray, device: str | None = None) -> np.ndarray:
-        return predict_with_gp_mean(self.models, x)
-
-    def predict_std(self, x: np.ndarray) -> np.ndarray:
-        return predict_with_gp_std(self.models, x)
 
 
 @dataclass
@@ -140,35 +127,6 @@ def fit_kan_surrogates(
     return models
 
 
-def fit_gp_surrogates(
-    *,
-    archive_x: np.ndarray,
-    archive_y: np.ndarray,
-    seed: int,
-) -> list[GaussianProcessRegressor]:
-    archive_x = np.asarray(archive_x, dtype=np.float32)
-    archive_y = np.asarray(archive_y, dtype=np.float32)
-    models: list[GaussianProcessRegressor] = []
-
-    for obj_id in range(int(archive_y.shape[1])):
-        kernel = (
-            ConstantKernel(constant_value=1.0, constant_value_bounds="fixed")
-            * RBF(length_scale=0.5, length_scale_bounds="fixed")
-            + WhiteKernel(noise_level=1e-5, noise_level_bounds="fixed")
-        )
-        model = GaussianProcessRegressor(
-            kernel=kernel,
-            alpha=1e-6,
-            normalize_y=True,
-            optimizer=None,
-            random_state=int(seed) + int(obj_id),
-        )
-        model.fit(archive_x, archive_y[:, obj_id])
-        models.append(model)
-
-    return models
-
-
 def predict_with_kan(models: Sequence[Any], x: np.ndarray, device: str) -> np.ndarray:
     x_arr = np.asarray(x, dtype=np.float32)
     x_tensor = torch.tensor(x_arr, dtype=torch.float32, device=str(device))
@@ -178,24 +136,6 @@ def predict_with_kan(models: Sequence[Any], x: np.ndarray, device: str) -> np.nd
             pred = model(x_tensor).detach().cpu().numpy().reshape(-1)
         preds.append(np.asarray(pred, dtype=np.float32))
     return np.stack(preds, axis=1).astype(np.float32)
-
-
-def predict_with_gp_mean(models: Sequence[GaussianProcessRegressor], x: np.ndarray, device: str | None = None) -> np.ndarray:
-    x_arr = np.asarray(x, dtype=np.float32)
-    mean_preds: list[np.ndarray] = []
-    for model in models:
-        mean = model.predict(x_arr)
-        mean_preds.append(np.asarray(mean, dtype=np.float32).reshape(-1))
-    return np.stack(mean_preds, axis=1).astype(np.float32)
-
-
-def predict_with_gp_std(models: Sequence[GaussianProcessRegressor], x: np.ndarray, device: str | None = None) -> np.ndarray:
-    x_arr = np.asarray(x, dtype=np.float32)
-    std_preds: list[np.ndarray] = []
-    for model in models:
-        _, std = model.predict(x_arr, return_std=True)
-        std_preds.append(np.asarray(std, dtype=np.float32).reshape(-1))
-    return np.stack(std_preds, axis=1).astype(np.float32) + 1e-6
 
 
 def estimate_uncertainty(
@@ -590,6 +530,9 @@ class TabPFNMinMaxSurrogate:
     def predict_std(self, x: np.ndarray) -> np.ndarray:
         _, std = self.predict_mean_std(x)
         return std
+
+
+from surrogate.gp import GPSurrogateModel, fit_gp_surrogates, predict_with_gp_mean, predict_with_gp_std
 
 
 # Backwards/ergonomic aliases (requested names)

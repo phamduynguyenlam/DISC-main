@@ -24,8 +24,6 @@ from surrogate.surrogate_model import (
     fit_kan_surrogates,
     fit_tabpfn_surrogate,
     KANSurrogateModel,
-    predict_with_gp_mean,
-    predict_with_gp_std,
 )
 
 
@@ -167,23 +165,12 @@ def build_surrogate_from_cfg(cfg_dict, archive_x, archive_y):
     surrogate_device = str(cfg_dict.get("surrogate_device", cfg_dict.get("device", "cpu")))
 
     if surrogate_name == "gp":
-        gp_models = fit_gp_surrogates(
+        return fit_gp_surrogates(
             archive_x=np.asarray(archive_x, dtype=np.float32),
             archive_y=np.asarray(archive_y, dtype=np.float32),
             seed=int(cfg_dict.get("seed", 0)),
+            nu=int(cfg_dict.get("gp_nu", 5)),
         )
-
-        class _GPWrapper:
-            def __init__(self, models):
-                self.models = models
-
-            def predict_mean(self, x):
-                return predict_with_gp_mean(self.models, x)
-
-            def predict_std(self, x):
-                return predict_with_gp_std(self.models, x)
-
-        return _GPWrapper(gp_models)
 
     if surrogate_name == "kan":
         models = fit_kan_surrogates(

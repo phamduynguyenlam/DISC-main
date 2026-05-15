@@ -21,7 +21,6 @@ from surrogate.surrogate_model import (
     fit_kan_surrogates,
     fit_tabpfn_surrogate,
     KANSurrogateModel,
-    predict_with_gp_std,
     surrogate_model_name,
 )
 
@@ -40,7 +39,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--offspring_size", type=int, default=80)
     parser.add_argument("--mutation_sigma", type=float, default=0.12)
     parser.add_argument("--logit_scale", type=float, default=5.0)
-    parser.add_argument("--disc-checkpoint", type=str, default=None)
+    parser.add_argument("--agent_pth", type=str, default=None)
     parser.add_argument("--random_model", action="store_true")
     parser.add_argument("--surrogate_model", type=str, default="gp", choices=["gp", "kan", "tabpfn"])
     parser.add_argument("--kan_steps", type=int, default=25)
@@ -94,25 +93,12 @@ def latin_hypercube_sample(
 def build_surrogate(args: argparse.Namespace, archive_x: np.ndarray, archive_y: np.ndarray):
     name = surrogate_model_name(args)
     if name == "gp":
-        gp_models = fit_gp_surrogates(
+        return fit_gp_surrogates(
             archive_x=archive_x,
             archive_y=archive_y,
             seed=int(args.seed),
+            nu=int(getattr(args, "gp_nu", 5)),
         )
-
-        class _GPWrapper:
-            def __init__(self, models):
-                self.models = models
-
-            def predict_mean(self, x: np.ndarray) -> np.ndarray:
-                from surrogate.surrogate_model import predict_with_gp_mean
-
-                return predict_with_gp_mean(self.models, x)
-
-            def predict_std(self, x: np.ndarray) -> np.ndarray:
-                return predict_with_gp_std(self.models, x)
-
-        return _GPWrapper(gp_models)
 
     if name == "tabpfn":
         return fit_tabpfn_surrogate(
@@ -215,8 +201,8 @@ def build_disc(
     ).to(map_location)
     disc.eval()
 
-    if args.disc_checkpoint and not bool(args.random_model):
-        state = torch.load(args.disc_checkpoint, map_location=map_location)
+    if args.agent_pth and not bool(args.random_model):
+        state = torch.load(args.agent_pth, map_location=map_location)
         state_dict = state["state_dict"] if isinstance(state, dict) and "state_dict" in state else state
         disc.load_state_dict(state_dict, strict=True)
 
@@ -527,7 +513,7 @@ def main() -> None:
         "init_fe": int(args.init_fe),
         "evolution_fe": n_evo_steps,
         "surrogate_model": surrogate_model_name(args),
-        "disc_checkpoint": args.disc_checkpoint,
+        "agent_pth": args.agent_pth,
         "random_model": bool(args.random_model),
         "reference_point": ref_point.astype(float).tolist(),
         "archive_size": int(archive_x.shape[0]),
