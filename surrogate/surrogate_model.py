@@ -545,7 +545,7 @@ class TabPFNMinMaxSurrogate:
 
     @property
     def multi_context_signature(self) -> tuple[int, int, int]:
-        return (self.n_objectives, self.n_input_features, self.n_train_samples)
+        return (self.n_input_features, self.n_train_samples)
 
     @staticmethod
     def predict_multi_context(
@@ -667,22 +667,26 @@ def predict_multi_context_tabpfn(
         std = np.asarray(std, dtype=np.float32)
         return ([mean], [std]) if return_std else [mean]
 
-    signatures = [surrogate.multi_context_signature for surrogate in surrogates]
-    if len(set(signatures)) != 1:
-        raise ValueError(f"All TabPFN multi-context surrogates must share the same signature, got {signatures}.")
+    train_sizes = [int(surrogate.n_train_samples) for surrogate in surrogates]
+    if len(set(train_sizes)) != 1:
+        raise ValueError(f"All TabPFN multi-context surrogates must have the same number of train samples, got {train_sizes}.")
 
     normalized_queries = [surrogate._norm_x(np.asarray(query, dtype=np.float32)) for surrogate, query in zip(surrogates, queries)]
     n_contexts = int(len(surrogates))
-    n_objectives = int(surrogates[0].n_objectives)
+    max_objectives = max(int(surrogate.n_objectives) for surrogate in surrogates)
 
     means_by_context: list[list[np.ndarray]] = [[] for _ in range(n_contexts)]
     stds_by_context: list[list[np.ndarray]] = [[] for _ in range(n_contexts)]
 
-    for objective_idx in range(n_objectives):
-        classifiers = [surrogate._model.objectives[objective_idx].model for surrogate in surrogates]  # type: ignore[union-attr]
-        raw_logits_by_context = _tabpfn_classifier_raw_logits_multi_context(classifiers, normalized_queries)
+    for objective_idx in range(max_objectives):
+        context_ids = [idx for idx, surrogate in enumerate(surrogates) if int(surrogate.n_objectives) > objective_idx]
+        classifiers = [surrogates[idx]._model.objectives[objective_idx].model for idx in context_ids]  # type: ignore[union-attr]
+        query_subset = [normalized_queries[idx] for idx in context_ids]
+        raw_logits_by_context = _tabpfn_classifier_raw_logits_multi_context(classifiers, query_subset)
 
-        for context_idx, (surrogate, classifier, raw_logits) in enumerate(zip(surrogates, classifiers, raw_logits_by_context)):
+        for subset_idx, (classifier, raw_logits) in enumerate(zip(classifiers, raw_logits_by_context)):
+            context_idx = int(context_ids[subset_idx])
+            surrogate = surrogates[context_idx]
             probs = classifier.logits_to_probabilities(raw_logits)
             probs_np = probs.float().detach().cpu().numpy()
             probs_np = classifier._maybe_reweight_probas(probs_np)

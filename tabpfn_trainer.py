@@ -13,6 +13,9 @@ from typing import Any
 import numpy as np
 import torch
 import torch.optim as optim
+from pymoo.algorithms.moo.nsga2 import NSGA2
+from pymoo.core.problem import Problem
+from pymoo.termination import get_termination
 
 from agents.disc import Disc
 from surrogate.surrogate_model import TabPFNMinMaxSurrogate, predict_multi_context
@@ -23,9 +26,14 @@ from trainer import (
     build_surrogate_from_cfg,
     build_training_env_specs,
     clone_state_dict_cpu,
+    compute_env_reward,
     compute_ddqn_loss,
     env_key,
     epsilon_by_iter,
+    get_reference_point,
+    hypervolume,
+    latin_hypercube_sample,
+    make_nsga2_problem_adapter,
     rollout_episode_task_local,
     save_training_checkpoint,
     select_action_from_output,
@@ -231,6 +239,297 @@ class TabPFNDiscSAEAEnv(DiscSAEAEnv):
         return self.surrogate
 
 
+class _ManualNSGA2Problem(Problem):
+    def __init__(self, n_var: int, n_obj: int, xl: np.ndarray, xu: np.ndarray):
+        super().__init__(
+            n_var=int(n_var),
+            n_obj=int(n_obj),
+            xl=np.asarray(xl, dtype=np.float32),
+            xu=np.asarray(xu, dtype=np.float32),
+        )
+
+    def _evaluate(self, X, out, *args, **kwargs):
+        raise RuntimeError("Manual NSGA2 problem does not support direct evaluate(); use ask/tell with externally supplied F.")
+
+
+class SynchronizedTabPFNEnv(DiscSAEAEnv):
+    def reset_without_offspring(self):
+        self.t = 0
+        self.archive_x = latin_hypercube_sample(
+            n_samples=int(self.cfg["init_size"]),
+            dim=self.dim,
+            lower=self.problem.lower,
+            upper=self.problem.upper,
+            seed=self.seed,
+        )
+        self.archive_y = np.asarray(self.problem.evaluate(self.archive_x), dtype=np.float32)
+        self.ref_point = np.asarray(
+            get_reference_point(self.problem_name, n_obj=int(self.archive_y.shape[1])),
+            dtype=np.float32,
+        )
+        self.init_hv = float(hypervolume(self.archive_y, self.ref_point))
+        self.nsga2_problem = make_nsga2_problem_adapter(self.problem, int(self.archive_y.shape[1]))
+        self._fit_surrogate()
+
+    def set_offspring_pool(self, offspring_x: np.ndarray, offspring_y: np.ndarray, offspring_sigma: np.ndarray) -> None:
+        self.offspring_x = np.asarray(offspring_x, dtype=np.float32)
+        self.offspring_y = np.asarray(offspring_y, dtype=np.float32)
+        self.offspring_sigma = np.asarray(offspring_sigma, dtype=np.float32)
+
+    def apply_action_without_refresh(self, action_idx: int) -> tuple[float, bool]:
+        chosen_idx = int(np.clip(int(action_idx), 0, int(self.offspring_x.shape[0]) - 1))
+        previous_archive_y = np.asarray(self.archive_y, dtype=np.float32).copy()
+        chosen_x = self.offspring_x[chosen_idx : chosen_idx + 1]
+        chosen_y = np.asarray(self.problem.evaluate(chosen_x), dtype=np.float32)
+
+        self.archive_x = np.vstack([self.archive_x, chosen_x]).astype(np.float32)
+        self.archive_y = np.vstack([self.archive_y, chosen_y]).astype(np.float32)
+
+        reward = compute_env_reward(
+            previous_archive_y=previous_archive_y,
+            selected_y=chosen_y,
+            ref_point=self.ref_point,
+            reward_scheme_id=int(self.cfg["reward_scheme"]),
+        )
+
+        self.t += 1
+        done = self.t >= self.max_steps
+        if not done:
+            self._fit_surrogate()
+        return float(reward), bool(done)
+
+
+def _initial_nsga2_population(archive_x: np.ndarray, pop_size: int, seed: int) -> np.ndarray:
+    init_x = np.asarray(archive_x, dtype=np.float64)
+    if init_x.shape[0] >= int(pop_size):
+        return init_x[: int(pop_size)].copy()
+
+    rng = np.random.default_rng(int(seed))
+    idx = rng.integers(0, init_x.shape[0], size=int(pop_size))
+    return init_x[idx].copy()
+
+
+def _setup_synchronized_nsga2(env: SynchronizedTabPFNEnv) -> NSGA2:
+    init_x = _initial_nsga2_population(
+        archive_x=np.asarray(env.archive_x, dtype=np.float32),
+        pop_size=int(env.cfg["offspring_size"]),
+        seed=int(env.seed) + int(env.t),
+    )
+    algorithm = NSGA2(
+        pop_size=int(env.cfg["offspring_size"]),
+        sampling=init_x,
+        eliminate_duplicates=True,
+    )
+    problem = _ManualNSGA2Problem(
+        n_var=int(env.nsga2_problem.n_var),
+        n_obj=int(env.nsga2_problem.n_obj),
+        xl=np.asarray(env.nsga2_problem.xl, dtype=np.float32),
+        xu=np.asarray(env.nsga2_problem.xu, dtype=np.float32),
+    )
+    algorithm.setup(
+        problem=problem,
+        termination=get_termination("n_gen", max(1, int(env.cfg["surrogate_nsga_steps"]))),
+        seed=int(env.seed) + int(env.t),
+        verbose=False,
+    )
+    return algorithm
+
+
+def _predict_multi_context_logged(
+    surrogates: list[TabPFNMinMaxSurrogate],
+    queries: list[np.ndarray],
+    *,
+    return_std: bool,
+    log,
+    batch_label: str,
+):
+    started_at = time.perf_counter()
+    outputs = predict_multi_context(surrogates, queries, return_std=return_std)
+    elapsed = time.perf_counter() - started_at
+    total_points = sum(int(np.asarray(query).shape[0]) for query in queries)
+    max_dim = max(int(np.asarray(query).shape[1]) if np.asarray(query).ndim == 2 else 0 for query in queries)
+    objective_contexts = sum(int(surrogate.n_objectives) for surrogate in surrogates)
+    if log is not None:
+        log(
+            f"[TabPFN sync] {batch_label} | "
+            f"envs={len(surrogates)} | "
+            f"points={total_points} | "
+            f"dim={max_dim} | "
+            f"objective_contexts={objective_contexts} | "
+            f"time_sec={elapsed:.3f}"
+        )
+    return outputs
+
+
+def _refresh_offspring_synchronized(
+    envs: list[SynchronizedTabPFNEnv],
+    *,
+    log,
+    phase_label: str,
+) -> None:
+    if len(envs) == 0:
+        return
+
+    surrogates = [env.surrogate for env in envs]
+    if not all(isinstance(surrogate, TabPFNMinMaxSurrogate) for surrogate in surrogates):
+        raise TypeError("Synchronized TabPFN rollout requires every environment surrogate to be TabPFNMinMaxSurrogate.")
+
+    nsga_steps = max(1, int(envs[0].cfg["surrogate_nsga_steps"]))
+    algorithms = [_setup_synchronized_nsga2(env) for env in envs]
+
+    for gen_idx in range(nsga_steps):
+        infills = [algorithm.ask() for algorithm in algorithms]
+        queries = [np.asarray(infill.get("X"), dtype=np.float32) for infill in infills]
+        pred_means = _predict_multi_context_logged(
+            [surrogate for surrogate in surrogates if isinstance(surrogate, TabPFNMinMaxSurrogate)],
+            queries,
+            return_std=False,
+            log=log,
+            batch_label=f"{phase_label} | gen={gen_idx + 1:03d}/{nsga_steps:03d} | mode=mean",
+        )
+        for infill, pred_mean in zip(infills, pred_means):
+            infill.set("F", np.asarray(pred_mean, dtype=np.float64))
+        for algorithm, infill in zip(algorithms, infills):
+            algorithm.tell(infills=infill)
+
+    result_xs: list[np.ndarray] = []
+    result_ys: list[np.ndarray] = []
+    for algorithm in algorithms:
+        result = algorithm.result()
+        offspring_x = np.asarray(result.X, dtype=np.float32)
+        offspring_y = np.asarray(result.F, dtype=np.float32)
+        if offspring_x.ndim == 1:
+            offspring_x = offspring_x.reshape(1, -1)
+        if offspring_y.ndim == 1:
+            offspring_y = offspring_y.reshape(1, -1)
+        result_xs.append(offspring_x)
+        result_ys.append(offspring_y)
+
+    _, result_stds = _predict_multi_context_logged(
+        [surrogate for surrogate in surrogates if isinstance(surrogate, TabPFNMinMaxSurrogate)],
+        result_xs,
+        return_std=True,
+        log=log,
+        batch_label=f"{phase_label} | sigma | mode=std",
+    )
+
+    for env, offspring_x, offspring_y, offspring_sigma in zip(envs, result_xs, result_ys, result_stds):
+        env.set_offspring_pool(offspring_x, offspring_y, offspring_sigma)
+
+
+def rollout_episode_batch_synchronized(
+    state_dict_cpu,
+    cfg_dict,
+    rollout_specs: list[dict[str, int | str]],
+    epsilon,
+    log=None,
+):
+    device = str(cfg_dict.get("rollout_device", "cpu"))
+
+    agent = Disc(
+        hidden_dim=cfg_dict["hidden_dim"],
+        n_heads=cfg_dict["n_heads"],
+        ff_dim=cfg_dict["ff_dim"],
+        dropout=cfg_dict["dropout"],
+        logit_scale=cfg_dict["logit_scale"],
+        epsilon=epsilon,
+    ).to(device)
+
+    agent.load_state_dict(state_dict_cpu)
+    agent.eval()
+
+    envs = [
+        SynchronizedTabPFNEnv(
+            problem_name=str(spec["problem_name"]),
+            dim=int(spec["dim"]),
+            seed=int(spec["seed"]),
+            cfg_dict=cfg_dict,
+        )
+        for spec in rollout_specs
+    ]
+    for env in envs:
+        env.reset_without_offspring()
+
+    _refresh_offspring_synchronized(envs, log=log, phase_label="reset")
+
+    states = [env._build_state() for env in envs]
+    total_rewards = [0.0 for _ in envs]
+    transitions: list[list[tuple[Any, ...]]] = [[] for _ in envs]
+    dones = [False for _ in envs]
+
+    while not all(dones):
+        actions: list[int] = []
+        prev_states = states
+        for state in prev_states:
+            with torch.no_grad():
+                out = agent(
+                    x_true=to_tensor(state["x_true"][None, ...], device),
+                    y_true=to_tensor(state["y_true"][None, ...], device),
+                    x_sur=to_tensor(state["x_sur"][None, ...], device),
+                    y_sur=to_tensor(state["y_sur"][None, ...], device),
+                    sigma_sur=to_tensor(state["sigma_sur"][None, ...], device),
+                    progress=to_tensor(state["progress"].reshape(1, 1), device),
+                    lower_bound=to_tensor(state["lower_bound"][None, ...], device),
+                    upper_bound=to_tensor(state["upper_bound"][None, ...], device),
+                    decode_type=str(cfg_dict.get("policy_mode", "epsilon_greedy")),
+                    epsilon=epsilon,
+                )
+            actions.append(select_action_from_output(out))
+
+        step_dones: list[bool] = []
+        step_rewards: list[float] = []
+        for env, action in zip(envs, actions):
+            reward, done = env.apply_action_without_refresh(action)
+            step_rewards.append(float(reward))
+            step_dones.append(bool(done))
+
+        active_envs = [env for env, done in zip(envs, step_dones) if not done]
+        if active_envs:
+            _refresh_offspring_synchronized(active_envs, log=log, phase_label=f"step={active_envs[0].t:03d}")
+
+        next_states = []
+        for idx, (env, state, action, reward, done) in enumerate(zip(envs, prev_states, actions, step_rewards, step_dones)):
+            next_state = env._build_state()
+            transitions[idx].append(
+                (
+                    state["x_true"],
+                    state["y_true"],
+                    state["x_sur"],
+                    state["y_sur"],
+                    state["sigma_sur"],
+                    float(state["progress"][0]),
+                    state["lower_bound"],
+                    state["upper_bound"],
+                    action,
+                    reward,
+                    next_state["x_true"],
+                    next_state["y_true"],
+                    next_state["x_sur"],
+                    next_state["y_sur"],
+                    next_state["sigma_sur"],
+                    float(next_state["progress"][0]),
+                    float(done),
+                )
+            )
+            total_rewards[idx] += float(reward)
+            next_states.append(next_state)
+
+        states = next_states
+        dones = step_dones
+
+    return [
+        {
+            "transitions": transitions[idx],
+            "episode_reward": float(total_rewards[idx]),
+            "episode_steps": int(len(transitions[idx])),
+            "env_key": env_key(env.problem_name, env.dim),
+            "init_hv": float(env.init_hv),
+            "final_hv": float(env.current_hv()),
+        }
+        for idx, env in enumerate(envs)
+    ]
+
+
 def rollout_episode_task_batched(
     state_dict_cpu,
     cfg_dict,
@@ -384,9 +683,7 @@ def train_disc_ddqn_tabpfn(
     sampling_backend = "process_pool"
 
     if use_batched_tabpfn:
-        sampling_backend = "tabpfn_gpu_batch"
-        tabpfn_batcher = TabPFNBatchCoordinator(expected_requesters=actual_num_workers)
-        executor = ThreadPoolExecutor(max_workers=actual_num_workers)
+        sampling_backend = "tabpfn_gpu_sync"
     elif bool(use_ray):
         sampling_backend = "ray"
         try:
@@ -457,22 +754,18 @@ def train_disc_ddqn_tabpfn(
             state_cpu = clone_state_dict_cpu(agent)
             pre_update_state_dict = copy.deepcopy(agent.state_dict())
             futures = []
+            rollout_specs = []
             interact_start_time = time.perf_counter()
             for env_idx, spec in enumerate(env_specs):
                 for ep in range(int(cfg.episodes_per_worker)):
                     seed = 100000 * epoch_id + 1000 * env_idx + ep
                     if use_batched_tabpfn:
-                        futures.append(
-                            executor.submit(
-                                rollout_episode_task_batched,
-                                state_cpu,
-                                cfg_dict,
-                                spec["problem_name"],
-                                int(spec["dim"]),
-                                int(seed),
-                                epsilon,
-                                tabpfn_batcher,
-                            )
+                        rollout_specs.append(
+                            {
+                                "problem_name": str(spec["problem_name"]),
+                                "dim": int(spec["dim"]),
+                                "seed": int(seed),
+                            }
                         )
                     elif bool(use_ray):
                         futures.append(
@@ -498,18 +791,31 @@ def train_disc_ddqn_tabpfn(
                             )
                         )
 
-            if len(futures) == 0:
-                raise ValueError("No rollout tasks were created.")
-            if bool(use_ray):
-                results = ray_mod.get(futures)
+            if use_batched_tabpfn:
+                if len(rollout_specs) == 0:
+                    raise ValueError("No synchronized rollout tasks were created.")
+                results = rollout_episode_batch_synchronized(
+                    state_dict_cpu=state_cpu,
+                    cfg_dict=cfg_dict,
+                    rollout_specs=rollout_specs,
+                    epsilon=epsilon,
+                    log=log,
+                )
+                rollout_count = len(rollout_specs)
             else:
+                rollout_count = len(futures)
+            if not use_batched_tabpfn and len(futures) == 0:
+                raise ValueError("No rollout tasks were created.")
+            if not use_batched_tabpfn and bool(use_ray):
+                results = ray_mod.get(futures)
+            elif not use_batched_tabpfn:
                 results = [f.result() for f in futures]
             interact_elapsed = time.perf_counter() - interact_start_time
 
             log(
                 f"[Epoch {epoch_id:04d}] interact done | "
                 f"workers={actual_num_workers} | "
-                f"episodes={len(futures)} | "
+                f"episodes={rollout_count} | "
                 f"interact_time_sec={interact_elapsed:.3f}"
             )
 
