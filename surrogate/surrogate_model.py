@@ -535,7 +535,12 @@ class TabPFNMinMaxSurrogate:
     def n_train_samples(self) -> int:
         if self._model is None:
             raise RuntimeError("TabPFNMinMaxSurrogate is not fit yet.")
-        return int(self._model.objectives[0].model.executor_.ensemble_members[0].X_train.shape[0])
+        classifier = self._model.objectives[0].model
+        n_train_samples = getattr(classifier, "n_train_samples_", None)
+        if n_train_samples is not None:
+            return int(n_train_samples)
+        members = _get_tabpfn_ensemble_members(classifier)
+        return int(np.asarray(members[0].X_train).shape[0])
 
     @property
     def n_input_features(self) -> int:
@@ -557,6 +562,51 @@ class TabPFNMinMaxSurrogate:
         return predict_multi_context_tabpfn(surrogates, queries, return_std=return_std)
 
 
+class _TabPFNMultiContextUnavailableError(RuntimeError):
+    pass
+
+
+def _get_tabpfn_ensemble_members(classifier: Any) -> list[Any]:
+    visited_ids: set[int] = set()
+    queue = [getattr(classifier, "executor_", None), classifier]
+
+    while queue:
+        current = queue.pop(0)
+        if current is None:
+            continue
+        current_id = id(current)
+        if current_id in visited_ids:
+            continue
+        visited_ids.add(current_id)
+
+        members = getattr(current, "ensemble_members", None)
+        if isinstance(members, list) and len(members) > 0:
+            return members
+
+        for attr_name in ("executor_", "executor", "engine", "inference_engine", "wrapped_estimator_", "estimator"):
+            if hasattr(current, attr_name):
+                queue.append(getattr(current, attr_name))
+
+    raise _TabPFNMultiContextUnavailableError(
+        f"Could not locate TabPFN ensemble members for classifier type {type(classifier).__name__}."
+    )
+
+
+def _predict_multi_context_tabpfn_fallback(
+    surrogates: Sequence[TabPFNMinMaxSurrogate],
+    queries: Sequence[np.ndarray],
+    *,
+    return_std: bool = False,
+) -> list[np.ndarray] | tuple[list[np.ndarray], list[np.ndarray]]:
+    means: list[np.ndarray] = []
+    stds: list[np.ndarray] = []
+    for surrogate, query in zip(surrogates, queries):
+        mean, std = surrogate.predict_mean_std(query)
+        means.append(np.asarray(mean, dtype=np.float32))
+        stds.append(np.asarray(std, dtype=np.float32))
+    return (means, stds) if return_std else means
+
+
 def _tabpfn_classifier_raw_logits_multi_context(
     classifiers: Sequence[Any],
     queries: Sequence[np.ndarray],
@@ -570,8 +620,9 @@ def _tabpfn_classifier_raw_logits_multi_context(
         return []
 
     batch_size = int(len(classifiers))
-    n_estimators = int(len(classifiers[0].executor_.ensemble_members))
-    train_sizes = [int(clf.executor_.ensemble_members[0].X_train.shape[0]) for clf in classifiers]
+    all_members = [_get_tabpfn_ensemble_members(clf) for clf in classifiers]
+    n_estimators = int(len(all_members[0]))
+    train_sizes = [int(np.asarray(members[0].X_train).shape[0]) for members in all_members]
     if len(set(train_sizes)) != 1:
         raise ValueError(f"All contexts in a batched TabPFN forward must have the same number of train rows, got {train_sizes}.")
     train_rows = int(train_sizes[0])
@@ -579,7 +630,7 @@ def _tabpfn_classifier_raw_logits_multi_context(
     raw_logits_per_context: list[list[torch.Tensor]] = [[] for _ in range(batch_size)]
 
     for estimator_idx in range(n_estimators):
-        members = [clf.executor_.ensemble_members[estimator_idx] for clf in classifiers]
+        members = [members_for_classifier[estimator_idx] for members_for_classifier in all_members]
         configs = [member.config for member in members]
         x_tests = [np.asarray(member.transform_X_test(query), dtype=np.float32) for member, query in zip(members, queries)]
         max_query_rows = max(int(x_test.shape[0]) for x_test in x_tests)
@@ -666,40 +717,42 @@ def predict_multi_context_tabpfn(
         mean = np.asarray(mean, dtype=np.float32)
         std = np.asarray(std, dtype=np.float32)
         return ([mean], [std]) if return_std else [mean]
+    try:
+        train_sizes = [int(surrogate.n_train_samples) for surrogate in surrogates]
+        if len(set(train_sizes)) != 1:
+            raise ValueError(f"All TabPFN multi-context surrogates must have the same number of train samples, got {train_sizes}.")
 
-    train_sizes = [int(surrogate.n_train_samples) for surrogate in surrogates]
-    if len(set(train_sizes)) != 1:
-        raise ValueError(f"All TabPFN multi-context surrogates must have the same number of train samples, got {train_sizes}.")
+        normalized_queries = [surrogate._norm_x(np.asarray(query, dtype=np.float32)) for surrogate, query in zip(surrogates, queries)]
+        n_contexts = int(len(surrogates))
+        max_objectives = max(int(surrogate.n_objectives) for surrogate in surrogates)
 
-    normalized_queries = [surrogate._norm_x(np.asarray(query, dtype=np.float32)) for surrogate, query in zip(surrogates, queries)]
-    n_contexts = int(len(surrogates))
-    max_objectives = max(int(surrogate.n_objectives) for surrogate in surrogates)
+        means_by_context: list[list[np.ndarray]] = [[] for _ in range(n_contexts)]
+        stds_by_context: list[list[np.ndarray]] = [[] for _ in range(n_contexts)]
 
-    means_by_context: list[list[np.ndarray]] = [[] for _ in range(n_contexts)]
-    stds_by_context: list[list[np.ndarray]] = [[] for _ in range(n_contexts)]
+        for objective_idx in range(max_objectives):
+            context_ids = [idx for idx, surrogate in enumerate(surrogates) if int(surrogate.n_objectives) > objective_idx]
+            classifiers = [surrogates[idx]._model.objectives[objective_idx].model for idx in context_ids]  # type: ignore[union-attr]
+            query_subset = [normalized_queries[idx] for idx in context_ids]
+            raw_logits_by_context = _tabpfn_classifier_raw_logits_multi_context(classifiers, query_subset)
 
-    for objective_idx in range(max_objectives):
-        context_ids = [idx for idx, surrogate in enumerate(surrogates) if int(surrogate.n_objectives) > objective_idx]
-        classifiers = [surrogates[idx]._model.objectives[objective_idx].model for idx in context_ids]  # type: ignore[union-attr]
-        query_subset = [normalized_queries[idx] for idx in context_ids]
-        raw_logits_by_context = _tabpfn_classifier_raw_logits_multi_context(classifiers, query_subset)
+            for subset_idx, (classifier, raw_logits) in enumerate(zip(classifiers, raw_logits_by_context)):
+                context_idx = int(context_ids[subset_idx])
+                surrogate = surrogates[context_idx]
+                probs = classifier.logits_to_probabilities(raw_logits)
+                probs_np = probs.float().detach().cpu().numpy()
+                probs_np = classifier._maybe_reweight_probas(probs_np)
+                bins = surrogate._model.objectives[objective_idx].bins  # type: ignore[union-attr]
+                mean_norm, std_norm = tabpfn_probs_to_mean_std(probs_np, bins, normalize=True)
+                y_min = float(surrogate._y_min[objective_idx])  # type: ignore[index]
+                y_rng = float(surrogate._y_rng[objective_idx])  # type: ignore[index]
+                means_by_context[context_idx].append((y_min + mean_norm * y_rng).astype(np.float32))
+                stds_by_context[context_idx].append((std_norm * y_rng).astype(np.float32))
 
-        for subset_idx, (classifier, raw_logits) in enumerate(zip(classifiers, raw_logits_by_context)):
-            context_idx = int(context_ids[subset_idx])
-            surrogate = surrogates[context_idx]
-            probs = classifier.logits_to_probabilities(raw_logits)
-            probs_np = probs.float().detach().cpu().numpy()
-            probs_np = classifier._maybe_reweight_probas(probs_np)
-            bins = surrogate._model.objectives[objective_idx].bins  # type: ignore[union-attr]
-            mean_norm, std_norm = tabpfn_probs_to_mean_std(probs_np, bins, normalize=True)
-            y_min = float(surrogate._y_min[objective_idx])  # type: ignore[index]
-            y_rng = float(surrogate._y_rng[objective_idx])  # type: ignore[index]
-            means_by_context[context_idx].append((y_min + mean_norm * y_rng).astype(np.float32))
-            stds_by_context[context_idx].append((std_norm * y_rng).astype(np.float32))
-
-    mean_outputs = [np.stack(parts, axis=1).astype(np.float32) for parts in means_by_context]
-    std_outputs = [np.stack(parts, axis=1).astype(np.float32) for parts in stds_by_context]
-    return (mean_outputs, std_outputs) if return_std else mean_outputs
+        mean_outputs = [np.stack(parts, axis=1).astype(np.float32) for parts in means_by_context]
+        std_outputs = [np.stack(parts, axis=1).astype(np.float32) for parts in stds_by_context]
+        return (mean_outputs, std_outputs) if return_std else mean_outputs
+    except _TabPFNMultiContextUnavailableError:
+        return _predict_multi_context_tabpfn_fallback(surrogates, queries, return_std=return_std)
 
 
 def predict_multi_context(
