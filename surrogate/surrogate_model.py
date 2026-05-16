@@ -622,6 +622,8 @@ def _tabpfn_classifier_raw_logits_multi_context(
     batch_size = int(len(classifiers))
     all_members = [_get_tabpfn_ensemble_members(clf) for clf in classifiers]
     n_estimators = int(len(all_members[0]))
+    if not all(len(members) == n_estimators for members in all_members):
+        raise ValueError("All TabPFN classifiers in a batched forward must expose the same number of ensemble members.")
     train_sizes = [int(np.asarray(members[0].X_train).shape[0]) for members in all_members]
     if len(set(train_sizes)) != 1:
         raise ValueError(f"All contexts in a batched TabPFN forward must have the same number of train rows, got {train_sizes}.")
@@ -631,72 +633,94 @@ def _tabpfn_classifier_raw_logits_multi_context(
 
     for estimator_idx in range(n_estimators):
         members = [members_for_classifier[estimator_idx] for members_for_classifier in all_members]
-        configs = [member.config for member in members]
-        x_tests = [np.asarray(member.transform_X_test(query), dtype=np.float32) for member, query in zip(members, queries)]
-        max_query_rows = max(int(x_test.shape[0]) for x_test in x_tests)
-        max_features = max(
-            max(int(np.asarray(member.X_train).shape[1]), int(x_test.shape[1]))
-            for member, x_test in zip(members, x_tests)
-        )
-
-        ref_clf = classifiers[0]
-        ref_model_index = int(configs[0]._model_index)
-        model = ref_clf.models_[ref_model_index]
-        device = ref_clf.devices_[0]
-        model = model.to(device)
-        dtype = ref_clf.forced_inference_dtype_ if ref_clf.forced_inference_dtype_ is not None else torch.float32
-
-        x_full = torch.zeros((train_rows + max_query_rows, batch_size, max_features), dtype=dtype, device=device)
-        y_train = torch.full((train_rows, batch_size), float("nan"), dtype=dtype, device=device)
-        categorical_inds: list[list[int]] = []
-        query_lengths: list[int] = []
-
-        for batch_idx, (member, x_test) in enumerate(zip(members, x_tests)):
-            x_train = np.asarray(member.X_train, dtype=np.float32)
-            x_full[:train_rows, batch_idx, : x_train.shape[1]] = torch.as_tensor(x_train, dtype=dtype, device=device)
-            if x_test.shape[0] > 0:
-                x_full[train_rows : train_rows + x_test.shape[0], batch_idx, : x_test.shape[1]] = torch.as_tensor(
-                    x_test,
-                    dtype=dtype,
-                    device=device,
-                )
-
-            y_arr = np.asarray(member.y_train, dtype=np.float32).reshape(-1)
-            y_train[:, batch_idx] = torch.as_tensor(y_arr, dtype=dtype, device=device)
-            categorical_inds.append(member.feature_schema.indices_for(FeatureModality.CATEGORICAL))
-            query_lengths.append(int(x_test.shape[0]))
-
-        kwargs = {}
-        if "task_type" in signature(model.forward).parameters:
-            kwargs["task_type"] = "multiclass"
-
-        with (
-            get_autocast_context(device, enabled=bool(ref_clf.use_autocast_)),
-            torch.inference_mode(),
-        ):
-            output = model(
-                x_full,
-                y_train,
-                only_return_standard_out=True,
-                categorical_inds=categorical_inds,
-                **kwargs,
+        per_context = []
+        for batch_idx, (clf, member, query) in enumerate(zip(classifiers, members, queries)):
+            x_test = np.asarray(member.transform_X_test(query), dtype=np.float32)
+            per_context.append(
+                {
+                    "batch_idx": int(batch_idx),
+                    "classifier": clf,
+                    "member": member,
+                    "config": member.config,
+                    "x_test": x_test,
+                }
             )
 
-        if output.ndim != 3:
-            raise ValueError(f"Expected TabPFN model output with 3 dims, got shape={tuple(output.shape)}.")
+        model_groups: dict[int, list[dict[str, Any]]] = {}
+        for item in per_context:
+            model_groups.setdefault(int(item["config"]._model_index), []).append(item)
 
-        for batch_idx, (clf, config, q_len) in enumerate(zip(classifiers, configs, query_lengths)):
-            logits = output[:q_len, batch_idx, :]
-            if config.class_permutation is None:
-                logits = logits[:, : clf.n_classes_]
-            else:
-                if len(config.class_permutation) != clf.n_classes_:
-                    use_perm = np.arange(clf.n_classes_)
-                    use_perm[: len(config.class_permutation)] = config.class_permutation
+        for model_index, group_items in model_groups.items():
+            ref_clf = group_items[0]["classifier"]
+            model = ref_clf.models_[model_index]
+            device = ref_clf.devices_[0]
+            model = model.to(device)
+            dtype = ref_clf.forced_inference_dtype_ if ref_clf.forced_inference_dtype_ is not None else torch.float32
+
+            max_query_rows = max(int(item["x_test"].shape[0]) for item in group_items)
+            max_features = max(
+                max(int(np.asarray(item["member"].X_train).shape[1]), int(item["x_test"].shape[1]))
+                for item in group_items
+            )
+            local_batch_size = int(len(group_items))
+
+            x_full = torch.zeros((train_rows + max_query_rows, local_batch_size, max_features), dtype=dtype, device=device)
+            y_train = torch.full((train_rows, local_batch_size), float("nan"), dtype=dtype, device=device)
+            categorical_inds: list[list[int]] = []
+            query_lengths: list[int] = []
+
+            for local_idx, item in enumerate(group_items):
+                member = item["member"]
+                x_test = item["x_test"]
+                x_train = np.asarray(member.X_train, dtype=np.float32)
+                x_full[:train_rows, local_idx, : x_train.shape[1]] = torch.as_tensor(x_train, dtype=dtype, device=device)
+                if x_test.shape[0] > 0:
+                    x_full[train_rows : train_rows + x_test.shape[0], local_idx, : x_test.shape[1]] = torch.as_tensor(
+                        x_test,
+                        dtype=dtype,
+                        device=device,
+                    )
+
+                y_arr = np.asarray(member.y_train, dtype=np.float32).reshape(-1)
+                y_train[:, local_idx] = torch.as_tensor(y_arr, dtype=dtype, device=device)
+                categorical_inds.append(member.feature_schema.indices_for(FeatureModality.CATEGORICAL))
+                query_lengths.append(int(x_test.shape[0]))
+
+            kwargs = {}
+            if "task_type" in signature(model.forward).parameters:
+                kwargs["task_type"] = "multiclass"
+
+            with (
+                get_autocast_context(device, enabled=bool(ref_clf.use_autocast_)),
+                torch.inference_mode(),
+            ):
+                output = model(
+                    x_full,
+                    y_train,
+                    only_return_standard_out=True,
+                    categorical_inds=categorical_inds,
+                    **kwargs,
+                )
+
+            if output.ndim != 3:
+                raise ValueError(f"Expected TabPFN model output with 3 dims, got shape={tuple(output.shape)}.")
+
+            for local_idx, item in enumerate(group_items):
+                clf = item["classifier"]
+                config = item["config"]
+                batch_idx = int(item["batch_idx"])
+                q_len = int(query_lengths[local_idx])
+                logits = output[:q_len, local_idx, :]
+                if config.class_permutation is None:
+                    logits = logits[:, : clf.n_classes_]
                 else:
-                    use_perm = config.class_permutation
-                logits = logits[:, use_perm]
-            raw_logits_per_context[batch_idx].append(logits)
+                    if len(config.class_permutation) != clf.n_classes_:
+                        use_perm = np.arange(clf.n_classes_)
+                        use_perm[: len(config.class_permutation)] = config.class_permutation
+                    else:
+                        use_perm = config.class_permutation
+                    logits = logits[:, use_perm]
+                raw_logits_per_context[batch_idx].append(logits)
 
     return [torch.stack(logits_per_estimator, dim=0) for logits_per_estimator in raw_logits_per_context]
 
@@ -725,28 +749,42 @@ def predict_multi_context_tabpfn(
         normalized_queries = [surrogate._norm_x(np.asarray(query, dtype=np.float32)) for surrogate, query in zip(surrogates, queries)]
         n_contexts = int(len(surrogates))
         max_objectives = max(int(surrogate.n_objectives) for surrogate in surrogates)
+        objective_mask = np.zeros((n_contexts, max_objectives), dtype=bool)
+        for context_idx, surrogate in enumerate(surrogates):
+            objective_mask[context_idx, : int(surrogate.n_objectives)] = True
 
         means_by_context: list[list[np.ndarray]] = [[] for _ in range(n_contexts)]
         stds_by_context: list[list[np.ndarray]] = [[] for _ in range(n_contexts)]
 
-        for objective_idx in range(max_objectives):
-            context_ids = [idx for idx, surrogate in enumerate(surrogates) if int(surrogate.n_objectives) > objective_idx]
-            classifiers = [surrogates[idx]._model.objectives[objective_idx].model for idx in context_ids]  # type: ignore[union-attr]
-            query_subset = [normalized_queries[idx] for idx in context_ids]
-            raw_logits_by_context = _tabpfn_classifier_raw_logits_multi_context(classifiers, query_subset)
+        flat_context_ids: list[int] = []
+        flat_objective_ids: list[int] = []
+        flat_classifiers: list[Any] = []
+        flat_queries: list[np.ndarray] = []
+        for context_idx in range(n_contexts):
+            for objective_idx in range(max_objectives):
+                if not objective_mask[context_idx, objective_idx]:
+                    continue
+                flat_context_ids.append(int(context_idx))
+                flat_objective_ids.append(int(objective_idx))
+                flat_classifiers.append(surrogates[context_idx]._model.objectives[objective_idx].model)  # type: ignore[union-attr]
+                flat_queries.append(normalized_queries[context_idx])
 
-            for subset_idx, (classifier, raw_logits) in enumerate(zip(classifiers, raw_logits_by_context)):
-                context_idx = int(context_ids[subset_idx])
-                surrogate = surrogates[context_idx]
-                probs = classifier.logits_to_probabilities(raw_logits)
-                probs_np = probs.float().detach().cpu().numpy()
-                probs_np = classifier._maybe_reweight_probas(probs_np)
-                bins = surrogate._model.objectives[objective_idx].bins  # type: ignore[union-attr]
-                mean_norm, std_norm = tabpfn_probs_to_mean_std(probs_np, bins, normalize=True)
-                y_min = float(surrogate._y_min[objective_idx])  # type: ignore[index]
-                y_rng = float(surrogate._y_rng[objective_idx])  # type: ignore[index]
-                means_by_context[context_idx].append((y_min + mean_norm * y_rng).astype(np.float32))
-                stds_by_context[context_idx].append((std_norm * y_rng).astype(np.float32))
+        raw_logits_by_flat_pair = _tabpfn_classifier_raw_logits_multi_context(flat_classifiers, flat_queries)
+
+        for flat_idx, (classifier, raw_logits, context_idx, objective_idx) in enumerate(
+            zip(flat_classifiers, raw_logits_by_flat_pair, flat_context_ids, flat_objective_ids)
+        ):
+            del flat_idx
+            surrogate = surrogates[context_idx]
+            probs = classifier.logits_to_probabilities(raw_logits)
+            probs_np = probs.float().detach().cpu().numpy()
+            probs_np = classifier._maybe_reweight_probas(probs_np)
+            bins = surrogate._model.objectives[objective_idx].bins  # type: ignore[union-attr]
+            mean_norm, std_norm = tabpfn_probs_to_mean_std(probs_np, bins, normalize=True)
+            y_min = float(surrogate._y_min[objective_idx])  # type: ignore[index]
+            y_rng = float(surrogate._y_rng[objective_idx])  # type: ignore[index]
+            means_by_context[context_idx].append((y_min + mean_norm * y_rng).astype(np.float32))
+            stds_by_context[context_idx].append((std_norm * y_rng).astype(np.float32))
 
         mean_outputs = [np.stack(parts, axis=1).astype(np.float32) for parts in means_by_context]
         std_outputs = [np.stack(parts, axis=1).astype(np.float32) for parts in stds_by_context]
