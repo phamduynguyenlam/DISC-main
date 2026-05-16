@@ -629,100 +629,111 @@ def _tabpfn_classifier_raw_logits_multi_context(
         raise ValueError(f"All contexts in a batched TabPFN forward must have the same number of train rows, got {train_sizes}.")
     train_rows = int(train_sizes[0])
 
-    raw_logits_per_context: list[list[torch.Tensor]] = [[] for _ in range(batch_size)]
+    raw_logits_per_context: list[list[torch.Tensor | None]] = [
+        [None for _ in range(n_estimators)] for _ in range(batch_size)
+    ]
 
-    for estimator_idx in range(n_estimators):
-        members = [members_for_classifier[estimator_idx] for members_for_classifier in all_members]
-        per_context = []
-        for batch_idx, (clf, member, query) in enumerate(zip(classifiers, members, queries)):
-            x_test = np.asarray(member.transform_X_test(query), dtype=np.float32)
-            per_context.append(
+    flat_items: list[dict[str, Any]] = []
+    for batch_idx, (clf, members, query) in enumerate(zip(classifiers, all_members, queries)):
+        for estimator_idx, member in enumerate(members):
+            flat_items.append(
                 {
                     "batch_idx": int(batch_idx),
+                    "estimator_idx": int(estimator_idx),
                     "classifier": clf,
                     "member": member,
                     "config": member.config,
-                    "x_test": x_test,
+                    "x_test": np.asarray(member.transform_X_test(query), dtype=np.float32),
                 }
             )
 
-        model_groups: dict[int, list[dict[str, Any]]] = {}
-        for item in per_context:
-            model_groups.setdefault(int(item["config"]._model_index), []).append(item)
+    model_groups: dict[int, list[dict[str, Any]]] = {}
+    for item in flat_items:
+        model_groups.setdefault(int(item["config"]._model_index), []).append(item)
 
-        for model_index, group_items in model_groups.items():
-            ref_clf = group_items[0]["classifier"]
-            model = ref_clf.models_[model_index]
-            device = ref_clf.devices_[0]
-            model = model.to(device)
-            dtype = ref_clf.forced_inference_dtype_ if ref_clf.forced_inference_dtype_ is not None else torch.float32
+    for model_index, group_items in model_groups.items():
+        ref_clf = group_items[0]["classifier"]
+        model = ref_clf.models_[model_index]
+        device = ref_clf.devices_[0]
+        model = model.to(device)
+        dtype = ref_clf.forced_inference_dtype_ if ref_clf.forced_inference_dtype_ is not None else torch.float32
 
-            max_query_rows = max(int(item["x_test"].shape[0]) for item in group_items)
-            max_features = max(
-                max(int(np.asarray(item["member"].X_train).shape[1]), int(item["x_test"].shape[1]))
-                for item in group_items
-            )
-            local_batch_size = int(len(group_items))
+        max_query_rows = max(int(item["x_test"].shape[0]) for item in group_items)
+        max_features = max(
+            max(int(np.asarray(item["member"].X_train).shape[1]), int(item["x_test"].shape[1]))
+            for item in group_items
+        )
+        local_batch_size = int(len(group_items))
 
-            x_full = torch.zeros((train_rows + max_query_rows, local_batch_size, max_features), dtype=dtype, device=device)
-            y_train = torch.full((train_rows, local_batch_size), float("nan"), dtype=dtype, device=device)
-            categorical_inds: list[list[int]] = []
-            query_lengths: list[int] = []
+        x_full = torch.zeros((train_rows + max_query_rows, local_batch_size, max_features), dtype=dtype, device=device)
+        y_train = torch.full((train_rows, local_batch_size), float("nan"), dtype=dtype, device=device)
+        categorical_inds: list[list[int]] = []
+        query_lengths: list[int] = []
 
-            for local_idx, item in enumerate(group_items):
-                member = item["member"]
-                x_test = item["x_test"]
-                x_train = np.asarray(member.X_train, dtype=np.float32)
-                x_full[:train_rows, local_idx, : x_train.shape[1]] = torch.as_tensor(x_train, dtype=dtype, device=device)
-                if x_test.shape[0] > 0:
-                    x_full[train_rows : train_rows + x_test.shape[0], local_idx, : x_test.shape[1]] = torch.as_tensor(
-                        x_test,
-                        dtype=dtype,
-                        device=device,
-                    )
-
-                y_arr = np.asarray(member.y_train, dtype=np.float32).reshape(-1)
-                y_train[:, local_idx] = torch.as_tensor(y_arr, dtype=dtype, device=device)
-                categorical_inds.append(member.feature_schema.indices_for(FeatureModality.CATEGORICAL))
-                query_lengths.append(int(x_test.shape[0]))
-
-            kwargs = {}
-            if "task_type" in signature(model.forward).parameters:
-                kwargs["task_type"] = "multiclass"
-
-            with (
-                get_autocast_context(device, enabled=bool(ref_clf.use_autocast_)),
-                torch.inference_mode(),
-            ):
-                output = model(
-                    x_full,
-                    y_train,
-                    only_return_standard_out=True,
-                    categorical_inds=categorical_inds,
-                    **kwargs,
+        for local_idx, item in enumerate(group_items):
+            member = item["member"]
+            x_test = item["x_test"]
+            x_train = np.asarray(member.X_train, dtype=np.float32)
+            x_full[:train_rows, local_idx, : x_train.shape[1]] = torch.as_tensor(x_train, dtype=dtype, device=device)
+            if x_test.shape[0] > 0:
+                x_full[train_rows : train_rows + x_test.shape[0], local_idx, : x_test.shape[1]] = torch.as_tensor(
+                    x_test,
+                    dtype=dtype,
+                    device=device,
                 )
 
-            if output.ndim != 3:
-                raise ValueError(f"Expected TabPFN model output with 3 dims, got shape={tuple(output.shape)}.")
+            y_arr = np.asarray(member.y_train, dtype=np.float32).reshape(-1)
+            y_train[:, local_idx] = torch.as_tensor(y_arr, dtype=dtype, device=device)
+            categorical_inds.append(member.feature_schema.indices_for(FeatureModality.CATEGORICAL))
+            query_lengths.append(int(x_test.shape[0]))
 
-            for local_idx, item in enumerate(group_items):
-                clf = item["classifier"]
-                config = item["config"]
-                batch_idx = int(item["batch_idx"])
-                q_len = int(query_lengths[local_idx])
-                logits = output[:q_len, local_idx, :]
-                if config.class_permutation is None:
-                    logits = logits[:, : clf.n_classes_]
+        kwargs = {}
+        if "task_type" in signature(model.forward).parameters:
+            kwargs["task_type"] = "multiclass"
+
+        with (
+            get_autocast_context(device, enabled=bool(ref_clf.use_autocast_)),
+            torch.inference_mode(),
+        ):
+            output = model(
+                x_full,
+                y_train,
+                only_return_standard_out=True,
+                categorical_inds=categorical_inds,
+                **kwargs,
+            )
+
+        if output.ndim != 3:
+            raise ValueError(f"Expected TabPFN model output with 3 dims, got shape={tuple(output.shape)}.")
+
+        for local_idx, item in enumerate(group_items):
+            clf = item["classifier"]
+            config = item["config"]
+            batch_idx = int(item["batch_idx"])
+            estimator_idx = int(item["estimator_idx"])
+            q_len = int(query_lengths[local_idx])
+            logits = output[:q_len, local_idx, :]
+            if config.class_permutation is None:
+                logits = logits[:, : clf.n_classes_]
+            else:
+                if len(config.class_permutation) != clf.n_classes_:
+                    use_perm = np.arange(clf.n_classes_)
+                    use_perm[: len(config.class_permutation)] = config.class_permutation
                 else:
-                    if len(config.class_permutation) != clf.n_classes_:
-                        use_perm = np.arange(clf.n_classes_)
-                        use_perm[: len(config.class_permutation)] = config.class_permutation
-                    else:
-                        use_perm = config.class_permutation
-                    logits = logits[:, use_perm]
-                raw_logits_per_context[batch_idx].append(logits)
+                    use_perm = config.class_permutation
+                logits = logits[:, use_perm]
+            raw_logits_per_context[batch_idx][estimator_idx] = logits
 
-    return [torch.stack(logits_per_estimator, dim=0) for logits_per_estimator in raw_logits_per_context]
+    stacked_outputs: list[torch.Tensor] = []
+    for batch_idx, logits_per_estimator in enumerate(raw_logits_per_context):
+        if any(logits is None for logits in logits_per_estimator):
+            missing = [idx for idx, logits in enumerate(logits_per_estimator) if logits is None]
+            raise RuntimeError(
+                f"Missing TabPFN logits for classifier batch index {batch_idx} at estimator indices {missing}."
+            )
+        stacked_outputs.append(torch.stack([logits for logits in logits_per_estimator if logits is not None], dim=0))
+
+    return stacked_outputs
 
 
 def predict_multi_context_tabpfn(
