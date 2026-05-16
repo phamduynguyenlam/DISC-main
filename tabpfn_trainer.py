@@ -15,6 +15,7 @@ import torch
 import torch.optim as optim
 
 from agents.disc import Disc
+from surrogate.surrogate_model import TabPFNMinMaxSurrogate, predict_multi_context
 from trainer import (
     DiscSAEAEnv,
     ReplayBuffer,
@@ -58,6 +59,12 @@ def _use_tabpfn_gpu_batch(cfg_dict: dict[str, Any]) -> bool:
     surrogate_name = str(cfg_dict.get("surrogate_model", "gp")).lower()
     surrogate_device = str(cfg_dict.get("surrogate_device", "cpu"))
     return surrogate_name == "tabpfn" and _is_cuda_device(surrogate_device)
+
+
+def _tabpfn_request_group_key(backend: Any, mode: str) -> tuple[Any, ...]:
+    if isinstance(backend, TabPFNMinMaxSurrogate):
+        return ("tabpfn_multi_context", str(mode), *backend.multi_context_signature)
+    return (id(backend), str(mode))
 
 
 @dataclass
@@ -119,23 +126,33 @@ class TabPFNBatchCoordinator:
 
             groups: dict[tuple[int, str], list[_TabPFNBatchRequest]] = {}
             for req in batch:
-                key = (id(req.backend), req.mode)
+                key = _tabpfn_request_group_key(req.backend, req.mode)
                 groups.setdefault(key, []).append(req)
 
-            for (_, mode), requests in groups.items():
+            for group_key, requests in groups.items():
                 backend = requests[0].backend
+                mode = str(requests[0].mode)
                 x_parts = [np.asarray(req.x, dtype=np.float32) for req in requests]
-                offsets = np.cumsum([0] + [int(part.shape[0]) for part in x_parts])
-                x_batch = np.concatenate(x_parts, axis=0).astype(np.float32)
                 batch_id = self._batch_counter + 1
                 eval_start_time = time.perf_counter()
                 try:
-                    if mode == "mean":
-                        pred_batch = _tabpfn_predict_mean_backend(backend, x_batch)
-                    elif mode == "std":
-                        pred_batch = _tabpfn_predict_std_backend(backend, x_batch)
+                    if isinstance(backend, TabPFNMinMaxSurrogate):
+                        if mode == "mean":
+                            group_outputs = predict_multi_context([req.backend for req in requests], x_parts, return_std=False)
+                        elif mode == "std":
+                            _, group_outputs = predict_multi_context([req.backend for req in requests], x_parts, return_std=True)
+                        else:
+                            raise ValueError(f"Unsupported TabPFN batch mode: {mode}")
                     else:
-                        raise ValueError(f"Unsupported TabPFN batch mode: {mode}")
+                        offsets = np.cumsum([0] + [int(part.shape[0]) for part in x_parts])
+                        x_batch = np.concatenate(x_parts, axis=0).astype(np.float32)
+                        if mode == "mean":
+                            pred_batch = _tabpfn_predict_mean_backend(backend, x_batch)
+                        elif mode == "std":
+                            pred_batch = _tabpfn_predict_std_backend(backend, x_batch)
+                        else:
+                            raise ValueError(f"Unsupported TabPFN batch mode: {mode}")
+                        group_outputs = [np.asarray(pred_batch[int(offsets[i]) : int(offsets[i + 1])], dtype=np.float32) for i in range(len(requests))]
                 except BaseException as exc:
                     for req in requests:
                         req.error = exc
@@ -143,19 +160,19 @@ class TabPFNBatchCoordinator:
                     continue
                 eval_elapsed = time.perf_counter() - eval_start_time
                 self._batch_counter = batch_id
+                total_points = sum(int(part.shape[0]) for part in x_parts)
+                max_dim = max(int(part.shape[1]) if part.ndim == 2 else 0 for part in x_parts)
                 print(
                     f"[TabPFN batch {batch_id:05d}] "
                     f"mode={mode} | "
                     f"requests={len(requests)} | "
-                    f"points={int(x_batch.shape[0])} | "
-                    f"dim={int(x_batch.shape[1]) if x_batch.ndim == 2 else 0} | "
+                    f"points={total_points} | "
+                    f"dim={max_dim} | "
                     f"time_sec={eval_elapsed:.3f}"
                 )
 
-                for req_idx, req in enumerate(requests):
-                    lo = int(offsets[req_idx])
-                    hi = int(offsets[req_idx + 1])
-                    req.result = np.asarray(pred_batch[lo:hi], dtype=np.float32)
+                for req, out in zip(requests, group_outputs):
+                    req.result = np.asarray(out, dtype=np.float32)
                     req.done.set()
 
 

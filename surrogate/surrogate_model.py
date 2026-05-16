@@ -418,7 +418,7 @@ def build_tabpfn_surrogate(
 
     models: list[Any] = []
     for _ in range(int(n_objectives)):
-        base = TabPFNClassifier()
+        base = TabPFNClassifier(device=tabpfn_device)
         if use_many_class_extension:
             try:
                 from tabpfn_extensions.manyclass_classifier import ManyClassClassifier  # type: ignore
@@ -530,6 +530,181 @@ class TabPFNMinMaxSurrogate:
     def predict_std(self, x: np.ndarray) -> np.ndarray:
         _, std = self.predict_mean_std(x)
         return std
+
+    @property
+    def n_train_samples(self) -> int:
+        if self._model is None:
+            raise RuntimeError("TabPFNMinMaxSurrogate is not fit yet.")
+        return int(self._model.objectives[0].model.executor_.ensemble_members[0].X_train.shape[0])
+
+    @property
+    def n_input_features(self) -> int:
+        if self._x_min is None:
+            raise RuntimeError("TabPFNMinMaxSurrogate is not fit yet (missing x stats).")
+        return int(self._x_min.shape[0])
+
+    @property
+    def multi_context_signature(self) -> tuple[int, int, int]:
+        return (self.n_objectives, self.n_input_features, self.n_train_samples)
+
+    @staticmethod
+    def predict_multi_context(
+        surrogates: Sequence["TabPFNMinMaxSurrogate"],
+        queries: Sequence[np.ndarray],
+        *,
+        return_std: bool = False,
+    ) -> list[np.ndarray] | tuple[list[np.ndarray], list[np.ndarray]]:
+        return predict_multi_context_tabpfn(surrogates, queries, return_std=return_std)
+
+
+def _tabpfn_classifier_raw_logits_multi_context(
+    classifiers: Sequence[Any],
+    queries: Sequence[np.ndarray],
+) -> list[torch.Tensor]:
+    from inspect import signature
+
+    from tabpfn.preprocessing.datamodel import FeatureModality  # type: ignore
+    from tabpfn.utils import get_autocast_context  # type: ignore
+
+    if len(classifiers) == 0:
+        return []
+
+    batch_size = int(len(classifiers))
+    n_estimators = int(len(classifiers[0].executor_.ensemble_members))
+    train_sizes = [int(clf.executor_.ensemble_members[0].X_train.shape[0]) for clf in classifiers]
+    if len(set(train_sizes)) != 1:
+        raise ValueError(f"All contexts in a batched TabPFN forward must have the same number of train rows, got {train_sizes}.")
+    train_rows = int(train_sizes[0])
+
+    raw_logits_per_context: list[list[torch.Tensor]] = [[] for _ in range(batch_size)]
+
+    for estimator_idx in range(n_estimators):
+        members = [clf.executor_.ensemble_members[estimator_idx] for clf in classifiers]
+        configs = [member.config for member in members]
+        x_tests = [np.asarray(member.transform_X_test(query), dtype=np.float32) for member, query in zip(members, queries)]
+        max_query_rows = max(int(x_test.shape[0]) for x_test in x_tests)
+        max_features = max(
+            max(int(np.asarray(member.X_train).shape[1]), int(x_test.shape[1]))
+            for member, x_test in zip(members, x_tests)
+        )
+
+        ref_clf = classifiers[0]
+        ref_model_index = int(configs[0]._model_index)
+        model = ref_clf.models_[ref_model_index]
+        device = ref_clf.devices_[0]
+        model = model.to(device)
+        dtype = ref_clf.forced_inference_dtype_ if ref_clf.forced_inference_dtype_ is not None else torch.float32
+
+        x_full = torch.zeros((train_rows + max_query_rows, batch_size, max_features), dtype=dtype, device=device)
+        y_train = torch.full((train_rows, batch_size), float("nan"), dtype=dtype, device=device)
+        categorical_inds: list[list[int]] = []
+        query_lengths: list[int] = []
+
+        for batch_idx, (member, x_test) in enumerate(zip(members, x_tests)):
+            x_train = np.asarray(member.X_train, dtype=np.float32)
+            x_full[:train_rows, batch_idx, : x_train.shape[1]] = torch.as_tensor(x_train, dtype=dtype, device=device)
+            if x_test.shape[0] > 0:
+                x_full[train_rows : train_rows + x_test.shape[0], batch_idx, : x_test.shape[1]] = torch.as_tensor(
+                    x_test,
+                    dtype=dtype,
+                    device=device,
+                )
+
+            y_arr = np.asarray(member.y_train, dtype=np.float32).reshape(-1)
+            y_train[:, batch_idx] = torch.as_tensor(y_arr, dtype=dtype, device=device)
+            categorical_inds.append(member.feature_schema.indices_for(FeatureModality.CATEGORICAL))
+            query_lengths.append(int(x_test.shape[0]))
+
+        kwargs = {}
+        if "task_type" in signature(model.forward).parameters:
+            kwargs["task_type"] = "multiclass"
+
+        with (
+            get_autocast_context(device, enabled=bool(ref_clf.use_autocast_)),
+            torch.inference_mode(),
+        ):
+            output = model(
+                x_full,
+                y_train,
+                only_return_standard_out=True,
+                categorical_inds=categorical_inds,
+                **kwargs,
+            )
+
+        if output.ndim != 3:
+            raise ValueError(f"Expected TabPFN model output with 3 dims, got shape={tuple(output.shape)}.")
+
+        for batch_idx, (clf, config, q_len) in enumerate(zip(classifiers, configs, query_lengths)):
+            logits = output[:q_len, batch_idx, :]
+            if config.class_permutation is None:
+                logits = logits[:, : clf.n_classes_]
+            else:
+                if len(config.class_permutation) != clf.n_classes_:
+                    use_perm = np.arange(clf.n_classes_)
+                    use_perm[: len(config.class_permutation)] = config.class_permutation
+                else:
+                    use_perm = config.class_permutation
+                logits = logits[:, use_perm]
+            raw_logits_per_context[batch_idx].append(logits)
+
+    return [torch.stack(logits_per_estimator, dim=0) for logits_per_estimator in raw_logits_per_context]
+
+
+def predict_multi_context_tabpfn(
+    surrogates: Sequence[TabPFNMinMaxSurrogate],
+    queries: Sequence[np.ndarray],
+    *,
+    return_std: bool = False,
+) -> list[np.ndarray] | tuple[list[np.ndarray], list[np.ndarray]]:
+    if len(surrogates) != len(queries):
+        raise ValueError(f"surrogates and queries must have the same length, got {len(surrogates)} and {len(queries)}.")
+    if len(surrogates) == 0:
+        return ([], []) if return_std else []
+
+    if len(surrogates) == 1:
+        mean, std = surrogates[0].predict_mean_std(queries[0])
+        mean = np.asarray(mean, dtype=np.float32)
+        std = np.asarray(std, dtype=np.float32)
+        return ([mean], [std]) if return_std else [mean]
+
+    signatures = [surrogate.multi_context_signature for surrogate in surrogates]
+    if len(set(signatures)) != 1:
+        raise ValueError(f"All TabPFN multi-context surrogates must share the same signature, got {signatures}.")
+
+    normalized_queries = [surrogate._norm_x(np.asarray(query, dtype=np.float32)) for surrogate, query in zip(surrogates, queries)]
+    n_contexts = int(len(surrogates))
+    n_objectives = int(surrogates[0].n_objectives)
+
+    means_by_context: list[list[np.ndarray]] = [[] for _ in range(n_contexts)]
+    stds_by_context: list[list[np.ndarray]] = [[] for _ in range(n_contexts)]
+
+    for objective_idx in range(n_objectives):
+        classifiers = [surrogate._model.objectives[objective_idx].model for surrogate in surrogates]  # type: ignore[union-attr]
+        raw_logits_by_context = _tabpfn_classifier_raw_logits_multi_context(classifiers, normalized_queries)
+
+        for context_idx, (surrogate, classifier, raw_logits) in enumerate(zip(surrogates, classifiers, raw_logits_by_context)):
+            probs = classifier.logits_to_probabilities(raw_logits)
+            probs_np = probs.float().detach().cpu().numpy()
+            probs_np = classifier._maybe_reweight_probas(probs_np)
+            bins = surrogate._model.objectives[objective_idx].bins  # type: ignore[union-attr]
+            mean_norm, std_norm = tabpfn_probs_to_mean_std(probs_np, bins, normalize=True)
+            y_min = float(surrogate._y_min[objective_idx])  # type: ignore[index]
+            y_rng = float(surrogate._y_rng[objective_idx])  # type: ignore[index]
+            means_by_context[context_idx].append((y_min + mean_norm * y_rng).astype(np.float32))
+            stds_by_context[context_idx].append((std_norm * y_rng).astype(np.float32))
+
+    mean_outputs = [np.stack(parts, axis=1).astype(np.float32) for parts in means_by_context]
+    std_outputs = [np.stack(parts, axis=1).astype(np.float32) for parts in stds_by_context]
+    return (mean_outputs, std_outputs) if return_std else mean_outputs
+
+
+def predict_multi_context(
+    surrogates: Sequence[TabPFNMinMaxSurrogate],
+    queries: Sequence[np.ndarray],
+    *,
+    return_std: bool = False,
+) -> list[np.ndarray] | tuple[list[np.ndarray], list[np.ndarray]]:
+    return predict_multi_context_tabpfn(surrogates, queries, return_std=return_std)
 
 
 from surrogate.gp import GPSurrogateModel, fit_gp_surrogates, predict_with_gp_mean, predict_with_gp_std
